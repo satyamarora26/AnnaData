@@ -1,0 +1,64 @@
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
+
+@import url('https://fonts.googleapis.com/css2?family=Outfit:wght@100..900&display=swap');
+
+
+
+.body {
+    font-family: "Outfit", sans-serif;
+}
+
+
+.result-data::-webkit-scrollbar {
+    display: none;
+}
+
+
+.result-data {
+    -ms-overflow-style: none;  
+    scrollbar-width: none;  
+}
+
+/* styles.css */
+@keyframes gradientAnimation {
+    0% {
+      background-position: 100% 0;
+    }
+    100% {
+      background-position: 0 0;
+    }
+  }
+  
+  .hr-animated {
+    background-size: 200% 200%;
+    animation: gradientAnimation 1s linear infinite;
+  }
+  
+
+  /* styles.css */
+.scrollbar-hide::-webkit-scrollbar {
+  display: none;
+}
+
+.scrollbar-hide {
+  -ms-overflow-style: none;  /* IE and Edge */
+  scrollbar-width: none;  /* Firefox */
+}
+
+/* Hide scrollbar for better UI */
+.scrollbar-hide {
+  -ms-overflow-style: none;  /* Internet Explorer 10+ */
+  scrollbar-width: none;  /* Firefox */
+}
+
+.scrollbar-hide::-webkit-scrollbar {
+  display: none;  /* Safari and Chrome */
+}
+
+
+
+  
+
+

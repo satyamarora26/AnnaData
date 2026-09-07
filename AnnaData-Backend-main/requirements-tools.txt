@@ -1,0 +1,17 @@
+# Everything the serving container needs, plus what only the offline work does.
+#
+# Use this for local development, for the evaluation harness, and for the
+# ingestion scripts in tools/. The deployed image installs requirements.txt
+# alone, so none of this is carried into a cold start.
+
+-r requirements.txt
+
+# --- Knowledge ingestion (tools/fetch_cibrc.py, load_cibrc.py, ingest_docs.py) ---
+pdfplumber==0.11.10
+pypdf==6.7.0
+
+# --- Evaluation harness (eval/run.py reads cases.yaml) ---
+PyYAML==6.0.3
+
+# --- Bedrock knowledge-base fallback (Web_Crawler.py, imported lazily) ---
+boto3==1.40.11

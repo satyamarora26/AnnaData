@@ -1,0 +1,21 @@
+# AWS Amplify Hosting build spec.
+#
+# Set REACT_APP_API_URL in the Amplify console (App settings -> Environment
+# variables) to the backend's App Runner URL. Create React App inlines env vars
+# at BUILD time, so changing it requires a redeploy, not just a restart.
+version: 1
+frontend:
+  phases:
+    preBuild:
+      commands:
+        - npm ci
+    build:
+      commands:
+        - npm run build
+  artifacts:
+    baseDirectory: build
+    files:
+      - '**/*'
+  cache:
+    paths:
+      - node_modules/**/*

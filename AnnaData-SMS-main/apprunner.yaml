@@ -1,0 +1,27 @@
+# AWS App Runner - source-based deploy for the SMS bridge.
+#
+# This service needs a stable public HTTPS URL, which is exactly what App Runner
+# provides - that URL replaces ngrok entirely. After the first deploy, set
+# PUBLIC_URL to the App Runner URL and run webhook.py once to register the
+# sms:received webhook with the gateway.
+#
+# Set in the console: APP_USERNAME, PASSWORD, AI_ENDPOINT, PUBLIC_URL.
+version: 1.0
+runtime: python3
+build:
+  commands:
+    build:
+      - pip install --upgrade pip
+      - pip install -r requirements.txt
+run:
+  runtime-version: 3.11
+  command: uvicorn app:app --host 0.0.0.0 --port 5000
+  network:
+    port: 5000
+  env:
+    - name: PYTHONUNBUFFERED
+      value: "1"
+    - name: PYTHONIOENCODING
+      value: "utf-8"
+    - name: SMS_MODE
+      value: cloud

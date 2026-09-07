@@ -1,0 +1,23 @@
+# AWS App Runner - source-based deploy (no Docker needed locally).
+# Console: App Runner -> Create service -> Source: GitHub -> this repo.
+#
+# Set secrets in the App Runner console (Configuration -> Environment variables),
+# NOT here. At minimum: GEMINI_API_KEY. Everything else is optional and the
+# service reports what is configured at GET /health.
+version: 1.0
+runtime: python3
+build:
+  commands:
+    build:
+      - pip install --upgrade pip
+      - pip install -r requirements.txt
+run:
+  runtime-version: 3.11
+  command: uvicorn app:app --host 0.0.0.0 --port 8000
+  network:
+    port: 8000
+  env:
+    - name: PYTHONUNBUFFERED
+      value: "1"
+    - name: PYTHONIOENCODING
+      value: "utf-8"

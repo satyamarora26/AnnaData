@@ -1,0 +1,122 @@
+# Render Blueprint — deploys all three AnnaData services from this one repo.
+#
+# Render reads this file automatically when you create a Blueprint from the
+# repo. Values marked `sync: false` are NOT stored here; Render prompts for them
+# at deploy time, which is how the API key and gateway password stay out of Git.
+#
+# Free instances sleep after ~15 minutes idle and take ~50s to wake. See the
+# "Keeping the services warm" section of README.md before pointing real farmers
+# at the SMS number.
+
+services:
+  # ----------------------------------------------------------------- backend
+  - type: web
+    name: annadata-backend
+    runtime: python
+    plan: free
+    region: singapore          # closest Render region to India
+    rootDir: AnnaData-Backend-main
+    buildCommand: pip install -r requirements.txt
+    startCommand: uvicorn app:app --host 0.0.0.0 --port $PORT
+    healthCheckPath: /health
+    envVars:
+      - key: PYTHON_VERSION
+        value: "3.12.7"
+      - key: PYTHONUNBUFFERED
+        value: "1"
+      # Farmer queries and answers are frequently Devanagari/Gurmukhi.
+      - key: PYTHONIOENCODING
+        value: "utf-8"
+      # The only required secret. Render will prompt for it.
+      - key: GEMINI_API_KEY
+        sync: false
+      # Fastest model first; later entries are fallbacks on 429/503/404.
+      - key: TEXT_MODELS
+        value: gemini-3.1-flash-lite,gemini-3.6-flash,gemini-3.5-flash-lite
+      - key: MEDIA_MODEL
+        value: gemini-3.5-flash-lite
+      # Set to the frontend's Render URL after the first deploy, so CORS allows it.
+      - key: FRONTEND_URL
+        sync: false
+      # Optional integrations — leave blank to disable; /health reports status.
+      # Postgres for farmer profiles and conversation memory (Neon).
+      - key: DATABASE_URL
+        sync: false
+      - key: GOV_API_KEY
+        sync: false
+      - key: LOCATION_API_KEY
+        sync: false
+      - key: EE_SERVICE_KEY
+        sync: false
+      - key: KNOWLEDGE_BASE_ID
+        sync: false
+      - key: AWS_ACCESS_KEY
+        sync: false
+      - key: AWS_SECRET_KEY
+        sync: false
+
+  # --------------------------------------------------------------- SMS bridge
+  - type: web
+    name: annadata-sms
+    runtime: python
+    plan: free
+    region: singapore
+    rootDir: AnnaData-SMS-main
+    buildCommand: pip install -r requirements.txt
+    startCommand: uvicorn app:app --host 0.0.0.0 --port $PORT
+    healthCheckPath: /health
+    envVars:
+      - key: PYTHON_VERSION
+        value: "3.12.7"
+      - key: PYTHONUNBUFFERED
+        value: "1"
+      - key: PYTHONIOENCODING
+        value: "utf-8"
+      - key: SMS_MODE
+        value: cloud
+      # From the Android app's "Cloud Server" section.
+      - key: APP_USERNAME
+        sync: false
+      - key: PASSWORD
+        sync: false
+      # Set these by hand after the first deploy, to the PUBLIC URLs shown at
+      # the top of each service's Render page.
+      #
+      # Do NOT use `fromService ... property: host` here: that resolves to
+      # Render's *internal* hostname (bare service name, no .onrender.com),
+      # which is not reachable as a public URL. Render also appends a random
+      # suffix when a service name is taken, so the public host is often not
+      # the name in this file.
+      #
+      #   AI_ENDPOINT = https://<backend-host>.onrender.com/agent
+      - key: AI_ENDPOINT
+        sync: false
+      #   PUBLIC_URL  = https://<this-service-host>.onrender.com
+      - key: PUBLIC_URL
+        sync: false
+      - key: MAX_SMS_SEGMENTS
+        value: "4"
+
+  # ----------------------------------------------------------------- frontend
+  - type: web
+    name: annadata-frontend
+    runtime: static
+    rootDir: AnnaData-Frontend-main
+    buildCommand: npm ci && npm run build
+    staticPublishPath: build
+    envVars:
+      # Set by hand to the backend's PUBLIC URL after the first deploy, then
+      # redeploy this service - Create React App inlines env vars at BUILD
+      # time, so a restart alone will not pick up a change.
+      #
+      #   REACT_APP_API_URL = https://<backend-host>.onrender.com
+      #
+      # Not `fromService`: that gives the internal hostname, which a browser
+      # cannot resolve.
+      - key: REACT_APP_API_URL
+        sync: false
+    routes:
+      # Single-page app: serve index.html for any unmatched path.
+      - type: rewrite
+        source: /*
+        destination: /index.html

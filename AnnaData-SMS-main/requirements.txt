@@ -1,0 +1,5 @@
+quart==0.19.9
+aiohttp==3.10.11
+python-dotenv==1.1.1
+uvicorn[standard]==0.35.0
+requests==2.32.4

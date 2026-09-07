@@ -1,0 +1,30 @@
+# Runtime dependencies only - what the serving container actually needs.
+#
+# Direct dependencies only. Transitive packages are resolved by pip. The
+# original file was a full `pip freeze` in UTF-16, which pip could not read and
+# which pinned transitive deps too tightly to install cleanly.
+#
+# PDF parsing, YAML and the AWS SDK are NOT here: they are used by tools/ and
+# eval/, or by a Bedrock fallback that is now imported lazily. Carrying them in
+# the image costs size and cold-start time on every request for code the serving
+# path never reaches. Install requirements-tools.txt for that work.
+
+# --- Web framework ---
+fastapi==0.116.1
+uvicorn[standard]==0.35.0
+python-multipart==0.0.20
+pydantic==2.11.7
+
+# --- LLM / agent ---
+langchain==0.3.27
+langchain-core==0.3.74
+langchain-google-genai==2.1.9
+google-genai==1.30.0
+
+# --- Data tools ---
+earthengine-api==1.6.3
+requests==2.32.4
+
+# --- Config and storage ---
+python-dotenv==1.1.1
+psycopg[binary,pool]==3.2.3
