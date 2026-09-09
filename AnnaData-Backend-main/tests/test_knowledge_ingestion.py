@@ -2,6 +2,7 @@ from contextlib import nullcontext
 from pathlib import Path
 
 import knowledge
+import pytest
 from source_catalog import load_catalog
 
 
@@ -21,14 +22,21 @@ class RecordingConnection:
     def __init__(self):
         self.calls = []
         self.ingestion_rows = []
+        self.staged_counts = (3, 3)
+        self.errors = {}
 
     def execute(self, sql, params=()):
         compact = " ".join(sql.split())
         self.calls.append((compact, params))
+        for needle, error in self.errors.items():
+            if needle in compact:
+                raise error
         if "SELECT 1 FROM ingestion_runs" in compact:
             return Result(None)
         if "RETURNING id" in compact:
             return Result((41,))
+        if "AS staged_count" in compact:
+            return Result(self.staged_counts)
         if "SELECT id, kind, source, status" in compact:
             return Result(rows=self.ingestion_rows)
         if "count(*) FROM pesticide_uses" in compact:
@@ -64,7 +72,17 @@ def test_document_activation_deactivates_old_version_before_publishing_new(monke
     assert knowledge.activate_documents(41, _spec(), "abc123", 3, 3, 0)
 
     statements = [sql for sql, _ in conn.calls]
-    assert statements.index("UPDATE documents SET active = FALSE WHERE source = %s AND active = TRUE") < statements.index("UPDATE documents SET active = TRUE WHERE ingestion_run_id = %s")
+    assert statements[0] == "SELECT pg_advisory_xact_lock(hashtext(%s))"
+    deactivate_index = statements.index(
+        "UPDATE documents SET active = FALSE WHERE source = %s AND active = TRUE"
+    )
+    publish_index = next(
+        index for index, sql in enumerate(statements)
+        if sql.startswith("UPDATE documents SET active = TRUE")
+    )
+    assert deactivate_index < publish_index
+    publish = statements[publish_index]
+    assert "source = %s AND content_hash = %s" in publish
     assert "status = 'completed'" in statements[-1]
 
 
@@ -74,6 +92,54 @@ def test_partial_stage_is_rejected_without_deactivating_current_corpus(monkeypat
     assert not knowledge.activate_documents(41, _spec(), "abc123", 3, 2, 1)
     assert not any("SET active = FALSE" in sql for sql, _ in conn.calls)
     assert any("status = 'failed'" in sql for sql, _ in conn.calls)
+
+
+@pytest.mark.parametrize("staged_counts", [(2, 2), (3, 2)])
+def test_stage_count_or_ownership_mismatch_fails_before_deactivation(monkeypatch, staged_counts):
+    conn = _recording_connection(monkeypatch)
+    conn.staged_counts = staged_counts
+
+    assert not knowledge.activate_documents(41, _spec(), "abc123", 3, 3, 0)
+
+    statements = [sql for sql, _ in conn.calls]
+    assert any("AS staged_count" in sql for sql in statements)
+    assert not any("SET active = FALSE" in sql for sql in statements)
+    assert any("status = 'failed'" in sql for sql in statements)
+
+
+def test_activation_cleanup_preserves_another_running_stage(monkeypatch):
+    conn = _recording_connection(monkeypatch)
+
+    assert knowledge.activate_documents(41, _spec(), "abc123", 3, 3, 0)
+
+    cleanup, params = next(
+        (sql, params) for sql, params in conn.calls
+        if sql.startswith("DELETE FROM documents AS stale")
+    )
+    assert "stale.ingestion_run_id <> %s" in cleanup
+    assert "status = 'running'" in cleanup
+    assert params == (_spec().id, 41)
+
+
+def test_activation_error_fails_run_and_cleans_its_staged_rows(monkeypatch):
+    conn = _recording_connection(monkeypatch)
+    conn.errors["UPDATE documents SET active = FALSE"] = RuntimeError("activation exploded")
+
+    assert not knowledge.activate_documents(41, _spec(), "abc123", 3, 3, 0)
+
+    statements = [sql for sql, _ in conn.calls]
+    assert any("DELETE FROM documents WHERE ingestion_run_id = %s" in sql for sql in statements)
+    assert any("status = 'failed'" in sql for sql in statements)
+    assert not any("status = 'completed'" in sql for sql in statements)
+
+
+def test_activation_error_does_not_hide_a_secondary_audit_failure(monkeypatch):
+    conn = _recording_connection(monkeypatch)
+    conn.errors["UPDATE documents SET active = FALSE"] = RuntimeError("activation exploded")
+    conn.errors["UPDATE ingestion_runs SET status = 'failed'"] = RuntimeError("audit exploded")
+
+    with pytest.raises(RuntimeError, match="activation exploded; unable to record ingestion failure: audit exploded"):
+        knowledge.activate_documents(41, _spec(), "abc123", 3, 3, 0)
 
 
 def test_stage_document_keeps_new_chunks_inactive_until_activation(monkeypatch):

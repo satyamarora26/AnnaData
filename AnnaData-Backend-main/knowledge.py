@@ -430,27 +430,62 @@ def activate_documents(run_id: int, spec: SourceSpec, content_hash: str,
     if parsed <= 0 or stored != parsed or rejected:
         fail_ingestion(run_id, "replacement corpus was incomplete", parsed, stored, rejected)
         return False
-    with db.connection() as conn:
-        conn.execute(
-            "UPDATE documents SET active = FALSE WHERE source = %s AND active = TRUE",
-            (spec.id,),
-        )
-        conn.execute(
-            "UPDATE documents SET active = TRUE WHERE ingestion_run_id = %s",
-            (run_id,),
-        )
-        conn.execute(
-            "DELETE FROM documents WHERE source = %s AND active = FALSE",
-            (spec.id,),
-        )
-        conn.execute(
-            """UPDATE ingestion_runs
-                  SET status = 'completed', parsed_count = %s, stored_count = %s,
-                      rejected_count = %s, completed_at = now()
-                WHERE id = %s""",
-            (parsed, stored, rejected, run_id),
-        )
-    return True
+    try:
+        with db.connection() as conn:
+            conn.execute(
+                "SELECT pg_advisory_xact_lock(hashtext(%s))",
+                (spec.id,),
+            )
+            staged_count, owned_count = conn.execute(
+                """SELECT count(*) AS staged_count,
+                          count(*) FILTER (
+                              WHERE source = %s AND content_hash = %s AND active = FALSE
+                          ) AS owned_count
+                     FROM documents
+                    WHERE ingestion_run_id = %s""",
+                (spec.id, content_hash, run_id),
+            ).fetchone()
+            if staged_count != parsed or owned_count != parsed:
+                raise ValueError("staged document ownership/count mismatch")
+            conn.execute(
+                "UPDATE documents SET active = FALSE WHERE source = %s AND active = TRUE",
+                (spec.id,),
+            )
+            conn.execute(
+                """UPDATE documents SET active = TRUE
+                     WHERE ingestion_run_id = %s AND source = %s
+                       AND content_hash = %s AND active = FALSE""",
+                (run_id, spec.id, content_hash),
+            )
+            conn.execute(
+                """DELETE FROM documents AS stale
+                     WHERE stale.source = %s AND stale.active = FALSE
+                       AND (stale.ingestion_run_id IS NULL OR stale.ingestion_run_id <> %s)
+                       AND NOT EXISTS (
+                           SELECT 1 FROM ingestion_runs AS stage
+                            WHERE stage.id = stale.ingestion_run_id
+                              AND stage.status = 'running'
+                       )""",
+                (spec.id, run_id),
+            )
+            conn.execute(
+                """UPDATE ingestion_runs
+                      SET status = 'completed', parsed_count = %s, stored_count = %s,
+                          rejected_count = %s, completed_at = now()
+                    WHERE id = %s""",
+                (parsed, stored, rejected, run_id),
+            )
+        return True
+    except Exception as exc:
+        failure_error = f"activation failed: {exc}"
+        try:
+            fail_ingestion(run_id, failure_error, parsed, stored, rejected)
+        except Exception as audit_exc:
+            raise RuntimeError(
+                f"{exc}; unable to record ingestion failure: {audit_exc}"
+            ) from audit_exc
+        print(f"Could not activate documents: {exc}")
+        return False
 
 
 def fail_ingestion(run_id: int, error: str, parsed: int = 0,
