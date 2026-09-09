@@ -35,8 +35,11 @@ def _record_fetch_failure(spec: SourceSpec, error: Exception) -> None:
 
 def fetch_source(spec: SourceSpec) -> bool:
     """Fetch one HTTP source without replacing a valid local file prematurely."""
-    if spec.fetch_mode == "browser":
-        print(f"browser download required: {spec.source_url} -> {spec.local_path}")
+    if spec.fetch_mode != "http":
+        if spec.fetch_mode == "browser":
+            print(f"browser download required: {spec.source_url} -> {spec.local_path}")
+        else:
+            print(f"unsupported fetch mode for {spec.id}: {spec.fetch_mode}", file=sys.stderr)
         return False
 
     path = spec.local_path
@@ -68,8 +71,11 @@ def fetch_source(spec: SourceSpec) -> bool:
         print(f"fetched {spec.id}: {path}")
         return True
     except Exception as exc:
-        part.unlink(missing_ok=True)
         _record_fetch_failure(spec, exc)
+        try:
+            part.unlink(missing_ok=True)
+        except Exception as cleanup_error:
+            print(f"could not remove temporary fetch file for {spec.id}: {cleanup_error}", file=sys.stderr)
         print(f"fetch failed for {spec.id}: {exc}", file=sys.stderr)
         return False
 

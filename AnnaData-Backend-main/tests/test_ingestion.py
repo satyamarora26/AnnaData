@@ -1,5 +1,6 @@
 import importlib.util
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 
@@ -65,6 +66,11 @@ def test_embedding_failure_preserves_active_corpus(tmp_path, monkeypatch):
     events = []
     monkeypatch.setattr(ingestion.knowledge, "start_ingestion", lambda kind, source, url, digest: 9)
     monkeypatch.setattr(ingestion.knowledge, "embed", lambda text: None)
+    monkeypatch.setattr(
+        ingestion.knowledge,
+        "activate_documents",
+        lambda *args: pytest.fail("failed ingestion must not activate documents"),
+    )
     monkeypatch.setattr(
         ingestion.knowledge,
         "fail_ingestion",
@@ -172,6 +178,158 @@ def test_fetch_uses_bounded_request_and_replaces_after_validation(tmp_path, monk
         "timeout": (10, 120),
         "stream": True,
     }
+
+
+def test_fetch_accepts_a_pdf_exactly_at_the_byte_limit(tmp_path, monkeypatch):
+    cli = _cli_module()
+    spec = _spec()
+    path = tmp_path / "pm-kisan.pdf"
+    spec = spec.__class__(**{**spec.__dict__, "local_path": path})
+    monkeypatch.setattr(ingestion, "MAX_SOURCE_BYTES", 8)
+
+    class Response:
+        headers = {"Content-Type": "application/pdf"}
+
+        def raise_for_status(self):
+            return None
+
+        def iter_content(self, chunk_size):
+            yield b"%PDF-123"
+
+    monkeypatch.setattr(cli.requests, "get", lambda *args, **kwargs: Response())
+
+    assert cli.fetch_source(spec)
+    assert path.read_bytes() == b"%PDF-123"
+
+
+def test_fetch_rejects_a_pdf_one_byte_over_the_limit_without_replacing(tmp_path, monkeypatch):
+    cli = _cli_module()
+    spec = _spec()
+    path = tmp_path / "pm-kisan.pdf"
+    path.write_bytes(b"%PDF-old")
+    spec = spec.__class__(**{**spec.__dict__, "local_path": path})
+    monkeypatch.setattr(ingestion, "MAX_SOURCE_BYTES", 8)
+
+    class Response:
+        headers = {"Content-Type": "application/pdf"}
+
+        def raise_for_status(self):
+            return None
+
+        def iter_content(self, chunk_size):
+            yield b"%PDF-1234"
+
+    monkeypatch.setattr(cli.requests, "get", lambda *args, **kwargs: Response())
+
+    assert not cli.fetch_source(spec)
+    assert path.read_bytes() == b"%PDF-old"
+
+
+def test_fetch_accepts_generic_octet_stream_after_pdf_signature_validation(tmp_path, monkeypatch):
+    cli = _cli_module()
+    spec = _spec()
+    path = tmp_path / "pm-kisan.pdf"
+    spec = spec.__class__(**{**spec.__dict__, "local_path": path})
+
+    class Response:
+        headers = {"Content-Type": "application/octet-stream"}
+
+        def raise_for_status(self):
+            return None
+
+        def iter_content(self, chunk_size):
+            yield b"%PDF-verified"
+
+    monkeypatch.setattr(cli.requests, "get", lambda *args, **kwargs: Response())
+
+    assert cli.fetch_source(spec)
+    assert path.read_bytes() == b"%PDF-verified"
+
+
+def test_fetch_rejects_conflicting_declared_media_without_reading_body(tmp_path, monkeypatch):
+    cli = _cli_module()
+    spec = _spec()
+    path = tmp_path / "pm-kisan.pdf"
+    path.write_bytes(b"%PDF-old")
+    spec = spec.__class__(**{**spec.__dict__, "local_path": path})
+
+    class Response:
+        headers = {"Content-Type": "text/html"}
+
+        def raise_for_status(self):
+            return None
+
+        def iter_content(self, chunk_size):
+            pytest.fail("conflicting media type must reject before reading the response body")
+
+    monkeypatch.setattr(cli.requests, "get", lambda *args, **kwargs: Response())
+
+    assert not cli.fetch_source(spec)
+    assert path.read_bytes() == b"%PDF-old"
+
+
+def test_fetch_refuses_non_http_modes(tmp_path, monkeypatch):
+    cli = _cli_module()
+    spec = _spec()
+    spec = spec.__class__(**{**spec.__dict__, "fetch_mode": "ftp", "local_path": tmp_path / "manual.pdf"})
+    monkeypatch.setattr(cli.requests, "get", lambda *args, **kwargs: pytest.fail("only http may fetch"))
+
+    assert not cli.fetch_source(spec)
+
+
+def test_dry_run_does_not_initialize_the_database(tmp_path, monkeypatch):
+    cli = _cli_module()
+    spec = _spec()
+    path = tmp_path / "guidance.txt"
+    path.write_text(_guidance_text(), encoding="utf-8")
+    spec = spec.__class__(**{**spec.__dict__, "local_path": path})
+    monkeypatch.setattr(
+        cli,
+        "_parse_args",
+        lambda: SimpleNamespace(
+            source_id=spec.id,
+            all=False,
+            fetch=False,
+            dry_run=True,
+            manifest=Path("ignored.json"),
+        ),
+    )
+    monkeypatch.setattr(cli, "load_catalog", lambda path: {spec.id: spec})
+    monkeypatch.setattr(cli.db, "init", lambda: pytest.fail("dry-run must not initialize the database"))
+
+    assert cli.main() == 0
+
+
+def test_cleanup_failure_still_records_the_fetch_audit(tmp_path, monkeypatch):
+    cli = _cli_module()
+    spec = _spec()
+    path = tmp_path / "pm-kisan.pdf"
+    spec = spec.__class__(**{**spec.__dict__, "local_path": path})
+    part = path.with_suffix(".pdf.part")
+
+    class Response:
+        headers = {"Content-Type": "application/pdf"}
+
+        def raise_for_status(self):
+            return None
+
+        def iter_content(self, chunk_size):
+            yield b"not a pdf"
+
+    original_unlink = Path.unlink
+
+    def fail_part_cleanup(candidate, *args, **kwargs):
+        if candidate == part:
+            raise OSError("cleanup denied")
+        return original_unlink(candidate, *args, **kwargs)
+
+    audits = []
+    monkeypatch.setattr(cli.requests, "get", lambda *args, **kwargs: Response())
+    monkeypatch.setattr(Path, "unlink", fail_part_cleanup)
+    monkeypatch.setattr(cli.knowledge, "record_ingestion_failure", lambda *args: audits.append(args))
+
+    assert not cli.fetch_source(spec)
+    assert audits and audits[0][:3] == ("fetch", spec.id, spec.source_url)
 
 
 def test_browser_source_is_not_fetched(tmp_path, monkeypatch, capsys):

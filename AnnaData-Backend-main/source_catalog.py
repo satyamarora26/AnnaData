@@ -8,6 +8,7 @@ from urllib.parse import urlparse
 
 Tier = Literal["official", "extension", "reference"]
 FetchMode = Literal["http", "browser"]
+DOWNLOADS_ROOT = Path("data") / "downloads"
 
 TRUSTED_HOSTS = {
     "pmkisan.gov.in",
@@ -49,6 +50,17 @@ def _tuple_scope(raw: dict) -> dict[str, tuple[str, ...]]:
     return {key: tuple(str(value) for value in values) for key, values in raw.items()}
 
 
+def _local_path(raw: str) -> Path:
+    path = Path(raw)
+    if (
+        path.is_absolute()
+        or ".." in path.parts
+        or path.parts[:len(DOWNLOADS_ROOT.parts)] != DOWNLOADS_ROOT.parts
+    ):
+        raise ValueError(f"invalid local path: {raw}")
+    return path
+
+
 def load_catalog(path: Path) -> dict[str, SourceSpec]:
     rows = json.loads(path.read_text(encoding="utf-8"))
     catalog: dict[str, SourceSpec] = {}
@@ -56,6 +68,8 @@ def load_catalog(path: Path) -> dict[str, SourceSpec]:
         assert_trusted_url(row["source_url"])
         if row["tier"] not in {"official", "extension", "reference"}:
             raise ValueError(f"invalid source tier: {row['tier']}")
+        if row["fetch_mode"] not in {"http", "browser"}:
+            raise ValueError(f"invalid fetch mode: {row['fetch_mode']}")
         published = date.fromisoformat(row["published_on"]) if row.get("published_on") else None
         spec = SourceSpec(
             id=row["id"],
@@ -67,7 +81,7 @@ def load_catalog(path: Path) -> dict[str, SourceSpec]:
             topics=tuple(row["topics"]),
             required_terms=tuple(row["required_terms"]),
             scope=_tuple_scope(row.get("scope", {})),
-            local_path=Path(row["local_path"]),
+            local_path=_local_path(row["local_path"]),
             fetch_mode=row["fetch_mode"],
         )
         if spec.id in catalog:
