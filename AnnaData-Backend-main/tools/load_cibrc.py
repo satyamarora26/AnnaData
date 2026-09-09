@@ -20,6 +20,8 @@ on their field.
     python tools/load_cibrc.py            # load everything in data/cibrc
     python tools/load_cibrc.py --dry-run  # parse and report, write nothing
 """
+import argparse
+import hashlib
 import re
 import sys
 from pathlib import Path
@@ -173,59 +175,97 @@ INSERT_SQL = """
     VALUES (%(category)s, %(product)s, %(crop)s, %(pest)s,
             %(dose_ai)s, %(dose_formulation)s, %(dilution)s,
             %(waiting_period)s, %(source)s, %(source_url)s)
-    ON CONFLICT (product, crop, pest) DO NOTHING
+    ON CONFLICT (product, crop, pest) DO UPDATE SET
+        dose_ai = EXCLUDED.dose_ai,
+        dose_formulation = EXCLUDED.dose_formulation,
+        dilution = EXCLUDED.dilution,
+        waiting_period = EXCLUDED.waiting_period,
+        source = EXCLUDED.source,
+        source_url = EXCLUDED.source_url
 """
 
-BATCH = 200
+def sha256_file(path: Path) -> str:
+    digest = hashlib.sha256()
+    with path.open("rb") as fh:
+        for chunk in iter(lambda: fh.read(1024 * 1024), b""):
+            digest.update(chunk)
+    return digest.hexdigest()
 
 
-def store(uses: list[dict]) -> int:
-    """Write in batches, each on its own connection.
-
-    Neon scales to zero and will close an idle connection, so a single
-    connection held open across thousands of single-row inserts drops halfway
-    through. Batching also turns thousands of round trips into a handful.
-    """
-    written = 0
-    for start in range(0, len(uses), BATCH):
-        chunk = uses[start:start + BATCH]
-        for attempt in (1, 2):
-            try:
-                with db.connection() as conn:
-                    with conn.cursor() as cur:
-                        cur.executemany(INSERT_SQL, chunk)
-                written += len(chunk)
-                break
-            except Exception as e:
-                if attempt == 2:
-                    print(f"    batch at {start} failed: {e}")
-                else:
-                    print(f"    batch at {start} retrying after: {str(e)[:70]}")
-    return written
+def replace_category(category: str, uses: list[dict], run_id: int) -> int:
+    """Replace one fully parsed statutory category in a single transaction."""
+    if not uses:
+        raise ValueError(f"no safe CIB&RC rows parsed for {category}")
+    with db.connection() as conn:
+        conn.execute("DELETE FROM pesticide_uses WHERE category = %s", (category,))
+        with conn.cursor() as cursor:
+            cursor.executemany(INSERT_SQL, uses)
+        conn.execute(
+            """UPDATE ingestion_runs SET status = 'completed', parsed_count = %s,
+                  stored_count = %s, completed_at = now() WHERE id = %s""",
+            (len(uses), len(uses), run_id),
+        )
+    return len(uses)
 
 
-def main() -> int:
-    dry = "--dry-run" in sys.argv
-    folder = Path("data/cibrc")
+def _parse_args(argv: list[str] | None = None) -> argparse.Namespace:
+    parser = argparse.ArgumentParser(description="Load reviewed CIB&RC PDF registers.")
+    parser.add_argument("--folder", type=Path, default=Path("data/cibrc"))
+    parser.add_argument("--dry-run", action="store_true")
+    return parser.parse_args(argv)
+
+
+def main(argv: list[str] | None = None) -> int:
+    args = _parse_args(argv)
+    dry = args.dry_run
+    folder = args.folder
     if not folder.is_dir():
         print("data/cibrc not found - run tools/fetch_cibrc.py first")
         return 1
 
-    if not dry:
-        db.init()
-        if not db.is_available():
-            print("No database. Set DATABASE_URL.")
-            return 1
-        knowledge.init()
-
     total = 0
+    reviewed = []
     for pdf in sorted(folder.glob("*.pdf")):
-        uses = parse_pdf(pdf, pdf.stem)
+        content_hash = sha256_file(pdf)
+        category = pdf.stem
+        try:
+            uses = parse_pdf(pdf, category)
+        except Exception as exc:
+            print(f"  {category:15} FAILED: {exc}")
+            reviewed.append((category, content_hash, None, exc))
+            continue
         total += len(uses)
-        if not dry and uses:
-            store(uses)
+        reviewed.append((category, content_hash, uses, None))
 
     print(f"\n{total} approved uses parsed from {folder}")
+    if dry:
+        return 0
+
+    db.init()
+    if not db.is_available():
+        print("No database. Set DATABASE_URL.")
+        return 1
+    knowledge.init()
+    for category, content_hash, uses, parse_error in reviewed:
+        source = f"cibrc:{category}"
+        if parse_error:
+            knowledge.record_ingestion_failure(
+                "cibrc", source, SOURCE_URL, f"PDF parsing failed: {parse_error}", content_hash
+            )
+            continue
+        if not uses:
+            knowledge.record_ingestion_failure(
+                "cibrc", source, SOURCE_URL, "no safe CIB&RC rows parsed", content_hash
+            )
+            continue
+        run_id = knowledge.start_ingestion(
+            "cibrc", source, SOURCE_URL, content_hash, skip_completed=False
+        )
+        try:
+            replace_category(category, uses, run_id)
+        except Exception as exc:
+            knowledge.fail_ingestion(run_id, f"CIB&RC replacement failed: {exc}", len(uses), 0, 0)
+            print(f"  {category:15} FAILED: {exc}")
     if not dry:
         print("stored:", knowledge.counts())
         db.close()

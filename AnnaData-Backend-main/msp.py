@@ -16,20 +16,35 @@ It is not a substitute for a local rate: a farmer often gets more than MSP, and
 for onion, potato and tomato there is no MSP at all. The wording says so.
 """
 import csv
+import hashlib
+import io
 import re
+from pathlib import Path
+from urllib.parse import urlparse
 
 import db
+import knowledge
 from knowledge import canonical_crop
 
 SCHEMA = """
 CREATE TABLE IF NOT EXISTS commodity_msp (
-    alias      TEXT PRIMARY KEY,
+    alias      TEXT NOT NULL,
     label      TEXT NOT NULL,
     msp        NUMERIC NOT NULL,
     crop_group TEXT,
     year       TEXT NOT NULL,
+    source     TEXT,
+    source_url TEXT,
+    content_hash TEXT,
     updated_at TIMESTAMPTZ NOT NULL DEFAULT now()
 );
+
+ALTER TABLE commodity_msp ADD COLUMN IF NOT EXISTS source TEXT;
+ALTER TABLE commodity_msp ADD COLUMN IF NOT EXISTS source_url TEXT;
+ALTER TABLE commodity_msp ADD COLUMN IF NOT EXISTS content_hash TEXT;
+ALTER TABLE commodity_msp DROP CONSTRAINT IF EXISTS commodity_msp_pkey;
+CREATE UNIQUE INDEX IF NOT EXISTS commodity_msp_alias_year
+    ON commodity_msp (alias, year);
 """
 
 
@@ -68,13 +83,9 @@ def aliases_for(label: str) -> list[str]:
     return sorted(names)
 
 
-def load_csv(path: str, year: str) -> dict:
-    """Load MSP figures from an Agmarknet price-and-arrival export."""
-    if not init():
-        return {"loaded": 0, "reason": "database unavailable"}
-
+def _parse_csv_bytes(content: bytes) -> list[tuple[str, str, float]]:
     rows = []
-    with open(path, encoding="utf-8-sig", newline="") as fh:
+    with io.StringIO(content.decode("utf-8-sig"), newline="") as fh:
         for row in csv.reader(fh):
             # The export carries two banner lines before the header, so the
             # commodity rows are found by shape rather than by position.
@@ -90,24 +101,89 @@ def load_csv(path: str, year: str) -> dict:
             if value <= 0:
                 continue
             rows.append((group, label, value))
+    return rows
+
+
+def parse_csv(path: str) -> list[tuple[str, str, float]]:
+    """Parse declared MSP values without opening a database connection."""
+    return _parse_csv_bytes(Path(path).read_bytes())
+
+
+def is_official_source_url(value: str) -> bool:
+    """MSP refreshes may only cite official Government of India hosts."""
+    parsed = urlparse(value)
+    host = (parsed.hostname or "").lower()
+    return parsed.scheme == "https" and (host == "gov.in" or host.endswith(".gov.in"))
+
+
+def replace_csv(path: str, year: str, source: str, source_url: str) -> dict:
+    """Atomically replace one marketing year's reviewed MSP aliases."""
+    content = Path(path).read_bytes()
+    content_hash = hashlib.sha256(content).hexdigest()
+    rows = _parse_csv_bytes(content)
+    audit_source = f"msp:{year}"
+    if not rows:
+        knowledge.record_ingestion_failure(
+            "msp", audit_source, source_url, "no valid MSP rows parsed", content_hash
+        )
+        raise ValueError("no valid MSP rows parsed")
+    if not is_official_source_url(source_url):
+        knowledge.record_ingestion_failure(
+            "msp", audit_source, source_url,
+            "source URL must use an official HTTPS .gov.in host", content_hash,
+        )
+        raise ValueError("source URL must use an official HTTPS .gov.in host")
+    if not init():
+        knowledge.record_ingestion_failure(
+            "msp", audit_source, source_url, "MSP table unavailable", content_hash
+        )
+        raise RuntimeError("MSP table unavailable")
+
+    run_id = knowledge.start_ingestion(
+        "msp", audit_source, source_url, content_hash, skip_completed=False
+    )
 
     written = 0
-    with db.connection() as conn:
-        for group, label, value in rows:
-            for alias in aliases_for(label):
-                conn.execute(
-                    """
-                    INSERT INTO commodity_msp (alias, label, msp, crop_group, year)
-                    VALUES (%s, %s, %s, %s, %s)
-                    ON CONFLICT (alias) DO UPDATE SET
-                        label = EXCLUDED.label, msp = EXCLUDED.msp,
-                        crop_group = EXCLUDED.crop_group, year = EXCLUDED.year,
-                        updated_at = now()
-                    """,
-                    (alias, label, value, group, year),
-                )
-                written += 1
-    return {"commodities": len(rows), "aliases": written, "year": year}
+    try:
+        with db.connection() as conn:
+            conn.execute("DELETE FROM commodity_msp WHERE year = %s", (year,))
+            for group, label, value in rows:
+                for alias in aliases_for(label):
+                    conn.execute(
+                        """
+                        INSERT INTO commodity_msp
+                            (alias, label, msp, crop_group, year, source, source_url,
+                             content_hash)
+                        VALUES (%s, %s, %s, %s, %s, %s, %s, %s)
+                        ON CONFLICT (alias, year) DO UPDATE SET
+                            label = EXCLUDED.label, msp = EXCLUDED.msp,
+                            crop_group = EXCLUDED.crop_group, year = EXCLUDED.year,
+                            source = EXCLUDED.source, source_url = EXCLUDED.source_url,
+                            content_hash = EXCLUDED.content_hash, updated_at = now()
+                        """,
+                        (alias, label, value, group, year, source, source_url, content_hash),
+                    )
+                    written += 1
+            conn.execute(
+                """UPDATE ingestion_runs SET status = 'completed', parsed_count = %s,
+                      stored_count = %s, completed_at = now() WHERE id = %s""",
+                (len(rows), written, run_id),
+            )
+    except Exception as exc:
+        knowledge.fail_ingestion(run_id, f"MSP replacement failed: {exc}", len(rows), 0, 0)
+        raise
+    return {
+        "commodities": len(rows), "aliases": written, "year": year,
+        "source": source, "content_hash": content_hash,
+    }
+
+
+def load_csv(path: str, year: str) -> dict:
+    """Backward-compatible MSP loader for the historical Agmarknet export."""
+    return replace_csv(
+        path, year, "Government of India Minimum Support Prices",
+        "https://agmarknet.gov.in/",
+    )
 
 
 def for_crop(crop: str | None) -> str:
@@ -118,14 +194,16 @@ def for_crop(crop: str | None) -> str:
         with db.connection() as conn:
             conn.execute(SCHEMA)
             row = conn.execute(
-                "SELECT label, msp, year FROM commodity_msp WHERE alias = %s",
+                """SELECT label, msp, year FROM commodity_msp WHERE alias = %s
+                   ORDER BY year DESC LIMIT 1""",
                 (crop.strip().lower(),),
             ).fetchone()
             if not row:
                 canonical = canonical_crop(crop)
                 if canonical and canonical != crop.strip().lower():
                     row = conn.execute(
-                        "SELECT label, msp, year FROM commodity_msp WHERE alias = %s",
+                        """SELECT label, msp, year FROM commodity_msp WHERE alias = %s
+                           ORDER BY year DESC LIMIT 1""",
                         (canonical,),
                     ).fetchone()
     except Exception as e:

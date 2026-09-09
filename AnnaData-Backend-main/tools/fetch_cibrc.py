@@ -8,7 +8,7 @@ dose AnnaData quotes can be checked rather than merely sounding right.
 
     python tools/fetch_cibrc.py [--out DIR]
 """
-import sys
+import argparse
 from pathlib import Path
 
 import requests
@@ -27,14 +27,52 @@ FILES = {
     "bioinsecticide": "/sites/default/files/6._mup_bio_insecticide_31.03.2026.pdf",
 }
 
-UA = ("Mozilla/5.0 (compatible; AnnaData/1.0 agricultural advisory; "
-      "+https://github.com/vibhuu22/AnnaData)")
+UA = (
+    "Mozilla/5.0 (compatible; AnnaData/1.0 agricultural advisory; "
+    "+https://github.com/satyamarora26/AnnaData)"
+)
+MAX_PDF_BYTES = 80 * 1024 * 1024
 
 
-def main() -> int:
-    out = Path("data/cibrc")
-    if "--out" in sys.argv:
-        out = Path(sys.argv[sys.argv.index("--out") + 1])
+def download_file(url: str, target: Path, timeout: int) -> int:
+    """Stream one PDF to a part file and publish it only after validation."""
+    part = target.with_suffix(target.suffix + ".part")
+    size = 0
+    try:
+        response = requests.get(
+            url, headers={"User-Agent": UA}, timeout=timeout, stream=True
+        )
+        response.raise_for_status()
+        with part.open("wb") as fh:
+            for chunk in response.iter_content(chunk_size=1024 * 1024):
+                if not chunk:
+                    continue
+                size += len(chunk)
+                if size > MAX_PDF_BYTES:
+                    raise ValueError("PDF exceeds 80 MiB limit")
+                fh.write(chunk)
+        if not part.read_bytes().startswith(b"%PDF-"):
+            raise ValueError("missing %PDF- signature")
+        part.replace(target)
+        return size
+    except Exception:
+        try:
+            part.unlink(missing_ok=True)
+        except OSError:
+            pass
+        raise
+
+
+def _parse_args(argv: list[str] | None = None) -> argparse.Namespace:
+    parser = argparse.ArgumentParser(description="Download CIB&RC pesticide registers.")
+    parser.add_argument("--out", type=Path, default=Path("data/cibrc"))
+    parser.add_argument("--timeout", type=int, default=300)
+    return parser.parse_args(argv)
+
+
+def main(argv: list[str] | None = None) -> int:
+    args = _parse_args(argv)
+    out = args.out
     out.mkdir(parents=True, exist_ok=True)
 
     print(f"Source: {SOURCE_PAGE}  (as on {AS_ON})")
@@ -42,13 +80,8 @@ def main() -> int:
     for category, path in FILES.items():
         target = out / f"{category}.pdf"
         try:
-            r = requests.get(BASE + path, headers={"User-Agent": UA}, timeout=300)
-            r.raise_for_status()
-            if not r.content.startswith(b"%PDF"):
-                print(f"  {category:15} not a PDF, skipped")
-                continue
-            target.write_bytes(r.content)
-            print(f"  {category:15} {len(r.content)/1e6:5.1f} MB -> {target}")
+            size = download_file(BASE + path, target, args.timeout)
+            print(f"  {category:15} {size / 1e6:5.1f} MB -> {target}")
             ok += 1
         except Exception as e:
             print(f"  {category:15} FAILED: {e}")

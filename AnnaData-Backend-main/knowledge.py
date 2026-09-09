@@ -368,13 +368,15 @@ def format_uses(result: dict, pest: str | None = None) -> str:
 
 # --- reference text ---------------------------------------------------------
 
-def start_ingestion(kind: str, source: str, source_url: str,
-                    content_hash: str) -> int | None:
+def start_ingestion(kind: str, source: str, source_url: str, content_hash: str,
+                    skip_completed: bool = True) -> int | None:
     """Create an auditable ingestion run unless this content is already live."""
     if not db.is_available():
         raise RuntimeError("database unavailable during ingestion")
     with db.connection() as conn:
-        if kind == "document":
+        if not skip_completed:
+            prior = None
+        elif kind == "document":
             prior = conn.execute(
                 """SELECT 1 FROM documents
                      WHERE source = %s AND content_hash = %s AND active = TRUE
