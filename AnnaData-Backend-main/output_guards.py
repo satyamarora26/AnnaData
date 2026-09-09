@@ -16,6 +16,11 @@ WELFARE_SCHEME = re.compile(
     r"soil health card|kusum|sarkari yojana|eligib(?:ility|le))\b",
     re.I,
 )
+LEGAL_QUANTITY = re.compile(
+    r"\b(?:legal|lawful|regulation|regulatory|statutory|permitted|allowed|"
+    r"maximum|minimum|limit|prohibited|banned)\b",
+    re.I,
+)
 
 _MATERIAL = (
     r"zinc\s+(?:sulphate|sulfate)|urea|dap|mop|ssp|potash|nitrogen|"
@@ -27,8 +32,8 @@ _BASIS = r"acres?|ha|hectares?|l|lit(?:re|er)s?"
 
 FERTILIZER_SUBJECT = re.compile(rf"\b(?:{_MATERIAL})\b", re.I)
 PESTICIDE_SUBJECT = re.compile(
-    r"\b(?:spray|pesticide|insecticide|fungicide|herbicide|chemical|"
-    r"registered\s+pesticide|dose|use)\b",
+    r"\b(?:spray(?:ed|ing|s)?|appl(?:y|ied|ying|ies)|use(?:d|ing|s)?|"
+    r"pesticide|insecticide|fungicide|herbicide|chemical|registered\s+pesticide|dose)\b",
     re.I,
 )
 
@@ -55,12 +60,12 @@ _WAITING_PERIOD = re.compile(
     re.I,
 )
 _PRODUCT_RECOMMENDATION = re.compile(
-    r"\b(?:spray|apply|use)\s+(?P<product>.+?)"
+    r"\b(?:spray(?:ed|ing|s)?|appl(?:y|ied|ying|ies)|use(?:d|ing|s)?)\s+(?P<product>.+?)"
     r"(?=\s+(?:at|@|for|on)\b|,|[.!?]|$)",
     re.I,
 )
 
-_MONEY_PREFIX = re.compile(r"(?:₹|\brs\.?\b|\binr\b)\s*([\d,]+(?:\.\d+)?)", re.I)
+_MONEY_PREFIX = re.compile(r"(?:₹|\brs\.?(?=\s|\d|$)|\binr\b)\s*([\d,]+(?:\.\d+)?)", re.I)
 _MONEY_SUFFIX = re.compile(
     r"\b([\d,]+(?:\.\d+)?)\s*(?:rupees?|rupaye|rupaiya|/-)\b", re.I
 )
@@ -69,7 +74,7 @@ _PERCENTAGE = re.compile(
     re.I,
 )
 FIGURE = re.compile(
-    r"(?:₹|\brs\.?\b|\binr\b)\s*[\d,]+(?:\.\d+)?|"
+    r"(?:₹|\brs\.?(?=\s|\d|$)|\binr\b)\s*[\d,]+(?:\.\d+)?|"
     r"\b[\d,]+(?:\.\d+)?\s*%(?=\s|$|[,.!?])|"
     r"\b[\d,]+(?:\.\d+)?\s*(?:percent|per\s?cent|pratishat|rupees?|rupaye|rupaiya|/-)\b",
     re.I,
@@ -79,10 +84,19 @@ ACTION_FALLBACK = (
     "Please contact your nearest Krishi Vigyan Kendra or agriculture officer "
     "for a verified recommendation."
 )
+_ABBREVIATION_PERIOD = re.compile(r"\b(?:rs|mr|mrs|ms|dr|prof|sr|jr|no|etc)\.", re.I)
+_PROTECTED_PERIOD = "\u0000"
 
 
 def _sentences(text: str) -> list[str]:
-    return re.split(r"(?<=[.!?।])\s+", text)
+    protected = _ABBREVIATION_PERIOD.sub(
+        lambda match: f"{match.group()[:-1]}{_PROTECTED_PERIOD}", text
+    )
+    return [
+        sentence.replace(_PROTECTED_PERIOD, ".").strip()
+        for sentence in re.split(r"\r?\n+|(?<=[.!?।])\s+", protected)
+        if sentence.strip()
+    ]
 
 
 def _normalise_space(value: str) -> str:
@@ -187,18 +201,93 @@ def extract_product_recommendations(text: str) -> set[str]:
     return products
 
 
+def _scope_matches_extension(scope, context: dict) -> bool:
+    """Apply the retrieval scope rules again before trusting extension advice."""
+    if not isinstance(scope, dict):
+        return False
+    for key in ("states", "crops"):
+        declared = scope.get(key)
+        if declared is None:
+            continue
+        if (
+            not isinstance(declared, (list, tuple))
+            or any(not isinstance(value, str) or not value.strip() for value in declared)
+        ):
+            return False
+        if declared:
+            requested = context.get("state" if key == "states" else "crop")
+            if not isinstance(requested, str) or requested.casefold() not in {
+                value.casefold() for value in declared
+            }:
+                return False
+    return True
+
+
 def _passage_texts(gathered: dict, allowed_tiers: set[str]) -> list[str]:
     passages = gathered.get("_kb_passages") or []
-    return [
-        passage.get("content", "")
-        for passage in passages
-        if isinstance(passage, dict) and passage.get("tier") in allowed_tiers
-    ]
+    context = gathered.get("_guard_context")
+    context = context if isinstance(context, dict) else gathered
+    texts = []
+    for passage in passages:
+        if not isinstance(passage, dict):
+            continue
+        tier = str(passage.get("tier") or "").casefold()
+        if tier not in allowed_tiers:
+            continue
+        if tier == "extension" and not _scope_matches_extension(passage.get("scope"), context):
+            continue
+        content = passage.get("content")
+        if isinstance(content, str):
+            texts.append(content)
+    return texts
 
 
 def _is_unmatched_dose_context(doses: str) -> bool:
     lowered = doses.lstrip().lower()
     return lowered.startswith("warning:") or lowered.startswith("no registered pesticide use")
+
+
+def _record_claims(record: dict) -> set[tuple[str, str, str, str]]:
+    claims = set()
+    for key in ("dose_formulation", "dose_ai", "dilution"):
+        value = record.get(key)
+        if isinstance(value, str):
+            claims.update(extract_input_claims(value))
+    return claims
+
+
+def _record_waiting_periods(record: dict) -> set[int]:
+    value = record.get("waiting_period")
+    if isinstance(value, int):
+        return {value} if value >= 0 else set()
+    if isinstance(value, str) and value.strip().isdigit():
+        return {int(value.strip())}
+    return set()
+
+
+def _matched_dose_records(gathered: dict) -> list[tuple[str, set, set]]:
+    doses = gathered.get("doses") or ""
+    if _is_unmatched_dose_context(doses):
+        return []
+    matched = []
+    for record in gathered.get("_dose_records") or []:
+        if not isinstance(record, dict) or not isinstance(record.get("product"), str):
+            continue
+        matched.append((
+            _normalise_space(record["product"]),
+            _record_claims(record),
+            _record_waiting_periods(record),
+        ))
+    return matched
+
+
+def _matches_dose_record(products: set[str], claims: set, periods: set[int], record: tuple) -> bool:
+    product, record_claims, record_periods = record
+    return (
+        (not products or products == {product})
+        and claims.issubset(record_claims)
+        and periods.issubset(record_periods)
+    )
 
 
 def _remove(category: str, reason: str) -> None:
@@ -217,19 +306,11 @@ def scrub(answer: str, gathered: dict) -> tuple[str, bool]:
     official_financial_figures = set()
     for passage in _passage_texts(gathered, {"official"}):
         official_financial_figures.update(extract_financial_figures(passage))
+    official_legal_claims = set()
+    for passage in _passage_texts(gathered, {"official"}):
+        official_legal_claims.update(extract_input_claims(passage))
 
-    doses = gathered.get("doses") or ""
-    if _is_unmatched_dose_context(doses):
-        pesticide_claims, waiting_periods = set(), set()
-    else:
-        pesticide_claims = extract_input_claims(doses)
-        waiting_periods = extract_waiting_periods(doses)
-
-    registered_products = {
-        _normalise_space(record["product"])
-        for record in (gathered.get("_dose_records") or [])
-        if isinstance(record, dict) and record.get("product")
-    }
+    dose_records = _matched_dose_records(gathered)
     msp_figures = extract_financial_figures(gathered.get("msp") or "")
 
     kept, changed = [], False
@@ -241,14 +322,20 @@ def scrub(answer: str, gathered: dict) -> tuple[str, bool]:
         periods = extract_waiting_periods(sentence)
         category = reason = None
 
-        if FERTILIZER_SUBJECT.search(sentence) and not claims.issubset(fertilizer_claims):
+        if LEGAL_QUANTITY.search(sentence) and claims and not claims.issubset(official_legal_claims):
+            category, reason = "legal", "unsupported_quantity"
+        elif FERTILIZER_SUBJECT.search(sentence) and not claims.issubset(fertilizer_claims):
             category, reason = "fertilizer", "unsupported_quantity"
-        elif PESTICIDE_SUBJECT.search(sentence):
-            if not claims.issubset(pesticide_claims):
-                category, reason = "pesticide", "unsupported_quantity"
-            elif products and not products.issubset(registered_products):
-                category, reason = "pesticide", "unsupported_product"
-        if category is None and periods and not periods.issubset(waiting_periods):
+        elif PESTICIDE_SUBJECT.search(sentence) and not FERTILIZER_SUBJECT.search(sentence):
+            if (claims or products or periods) and not any(
+                _matches_dose_record(products, claims, periods, record)
+                for record in dose_records
+            ):
+                category, reason = "pesticide", "unsupported_record"
+        if category is None and periods and not any(
+            _matches_dose_record(products, claims, periods, record)
+            for record in dose_records
+        ):
             category, reason = "pesticide", "unsupported_waiting_period"
         if category is None and PRICE_SCHEME.search(sentence):
             figures = extract_financial_figures(sentence)

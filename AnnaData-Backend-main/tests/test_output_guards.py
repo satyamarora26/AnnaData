@@ -1,17 +1,20 @@
 import output_guards
 
 
-def _extension(content):
+def _extension(content, scope=None):
     return {
         "tier": "extension",
         "content": content,
-        "scope": {"states": ["Punjab"], "crops": ["wheat"]},
+        "scope": scope if scope is not None else {"states": ["Punjab"], "crops": ["wheat"]},
     }
 
 
 def test_supported_fertilizer_quantity_survives():
     answer = "Apply 55 kg DAP per acre at sowing."
-    gathered = {"_kb_passages": [_extension("Apply 55 kg DAP per acre at sowing.")]}
+    gathered = {
+        "_guard_context": {"state": "Punjab", "crop": "wheat"},
+        "_kb_passages": [_extension("Apply 55 kg DAP per acre at sowing.")],
+    }
     assert output_guards.scrub(answer, gathered) == (answer, False)
 
 
@@ -74,3 +77,86 @@ def test_unregistered_pesticide_product_is_removed():
     assert changed
     assert "Acephate" not in cleaned
     assert "Remove affected leaves" in cleaned
+
+
+def test_out_of_scope_extension_quantity_is_removed():
+    answer = "Apply 55 kg DAP per acre. Keep the field evenly moist."
+    gathered = {
+        "_guard_context": {"state": "Punjab", "crop": "wheat"},
+        "_kb_passages": [
+            _extension("Apply 55 kg DAP per acre.", {"states": ["Haryana"], "crops": ["wheat"]})
+        ],
+    }
+    cleaned, changed = output_guards.scrub(answer, gathered)
+    assert changed
+    assert "55 kg" not in cleaned
+    assert "evenly moist" in cleaned
+
+
+def test_malformed_extension_scope_cannot_authorize_quantity():
+    answer = "Apply 55 kg DAP per acre. Keep the field evenly moist."
+    gathered = {
+        "_guard_context": {"state": "Punjab", "crop": "wheat"},
+        "_kb_passages": [_extension("Apply 55 kg DAP per acre.", {"states": "Punjab"})],
+    }
+    cleaned, changed = output_guards.scrub(answer, gathered)
+    assert changed
+    assert "55 kg" not in cleaned
+    assert "evenly moist" in cleaned
+
+
+def test_pesticide_product_dose_and_wait_must_share_one_record():
+    answer = "Spray Product A at 250 ml per hectare and wait 30 days before harvest. Remove affected leaves."
+    gathered = {
+        "doses": (
+            "Registered pesticide uses: Product A, dose 250 ml per hectare, wait 21 days before harvest. "
+            "Product B, dose 500 ml per hectare, wait 30 days before harvest."
+        ),
+        "_dose_records": [
+            {"product": "Product A", "dose_formulation": "250 ml per hectare", "waiting_period": "21"},
+            {"product": "Product B", "dose_formulation": "500 ml per hectare", "waiting_period": "30"},
+        ],
+    }
+    cleaned, changed = output_guards.scrub(answer, gathered)
+    assert changed
+    assert "Product A" not in cleaned
+    assert "Remove affected leaves" in cleaned
+
+
+def test_apply_action_cannot_bypass_pesticide_product_guard():
+    answer = "Apply Acephate at 500 ml per hectare. Remove affected leaves."
+    gathered = {
+        "doses": "Registered pesticide uses: Emamectin Benzoate 5% SG, dose 250 ml per hectare",
+        "_dose_records": [{"product": "Emamectin Benzoate 5% SG", "dose_formulation": "250 ml per hectare"}],
+    }
+    cleaned, changed = output_guards.scrub(answer, gathered)
+    assert changed
+    assert "Acephate" not in cleaned
+    assert "Remove affected leaves" in cleaned
+
+
+def test_abbreviated_rupee_sentence_keeps_subject_and_figure_together():
+    answer = "The MSP is Rs. 3,000 per quintal. Keep records of your sale."
+    gathered = {"msp": "Minimum Support Price for Wheat: Rs 2,585 per quintal."}
+    cleaned, changed = output_guards.scrub(answer, gathered)
+    assert changed
+    assert "3,000" not in cleaned
+    assert "Keep records" in cleaned
+
+
+def test_newline_separates_unsafe_quantity_from_practical_advice():
+    answer = "Apply 75 kg DAP per acre\nKeep the field evenly moist."
+    gathered = {"_kb_passages": [_extension("Apply 55 kg DAP per acre.")]}
+    cleaned, changed = output_guards.scrub(answer, gathered)
+    assert changed
+    assert "75 kg" not in cleaned
+    assert "evenly moist" in cleaned
+
+
+def test_reference_passage_cannot_authorize_legal_quantity():
+    answer = "The legal limit is 5 kg per acre. Keep records of applications."
+    gathered = {"_kb_passages": [{"tier": "reference", "content": "The legal limit is 5 kg per acre."}]}
+    cleaned, changed = output_guards.scrub(answer, gathered)
+    assert changed
+    assert "5 kg" not in cleaned
+    assert "Keep records" in cleaned

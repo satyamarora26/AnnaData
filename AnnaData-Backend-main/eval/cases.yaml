@@ -247,7 +247,7 @@
     longitude: 75.5004841
   expect:
     contains_any: ["soil test", "KVK", "Krishi Vigyan Kendra", "agriculture officer"]
-    not_contains_any: ["kg/acre", "kg per acre", "g/acre", "grams per acre"]
+    not_contains_any: ["kg/acre", "kg per acre", "kilograms per acre", "g/acre", "g per acre", "grams per acre", "kg/hectare", "kg per hectare", "kilograms per hectare", "g/hectare", "g per hectare", "grams per hectare"]
 
 - id: msp_answers_when_mandi_is_down
   tags:
