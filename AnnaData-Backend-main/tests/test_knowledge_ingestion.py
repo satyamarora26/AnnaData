@@ -267,6 +267,29 @@ def test_activation_error_does_not_hide_a_secondary_audit_failure(monkeypatch):
         knowledge.activate_documents(41, _spec(), "abc123", 3, 3, 0)
 
 
+def test_audit_lookup_error_does_not_mutate_the_run(monkeypatch):
+    conn = _recording_connection(monkeypatch)
+    conn.errors["FROM ingestion_runs WHERE id = %s FOR UPDATE"] = RuntimeError("audit lookup exploded")
+
+    assert not knowledge.activate_documents(41, _spec(), "abc123", 3, 3, 0)
+
+    statements = [sql for sql, _ in conn.calls]
+    assert not any(sql.startswith("DELETE FROM documents") for sql in statements)
+    assert not any("status = 'failed'" in sql for sql in statements)
+
+
+def test_completed_active_count_error_does_not_mutate_the_run(monkeypatch):
+    conn = _recording_connection(monkeypatch)
+    conn.audit_row = (_spec().id, "abc123", "completed", 3, 3, 0)
+    conn.errors["AS active_count"] = RuntimeError("active count exploded")
+
+    assert not knowledge.activate_documents(41, _spec(), "abc123", 3, 3, 0)
+
+    statements = [sql for sql, _ in conn.calls]
+    assert not any(sql.startswith("DELETE FROM documents") for sql in statements)
+    assert not any("status = 'failed'" in sql for sql in statements)
+
+
 def test_activation_preserves_running_stage_then_publishes_it(monkeypatch):
     conn = _stateful_connection(monkeypatch)
 

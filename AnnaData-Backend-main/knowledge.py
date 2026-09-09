@@ -427,6 +427,7 @@ def stage_document(run_id: int, spec: SourceSpec, content_hash: str,
 def activate_documents(run_id: int, spec: SourceSpec, content_hash: str,
                        parsed: int, stored: int, rejected: int) -> bool:
     """Atomically replace a source only when every parsed chunk was staged."""
+    running_run = False
     try:
         with db.connection() as conn:
             conn.execute(
@@ -460,7 +461,10 @@ def activate_documents(run_id: int, spec: SourceSpec, content_hash: str,
                     (run_id, spec.id, content_hash, spec.id),
                 ).fetchone()
                 return active_count == stored and owned_active_count == stored
-            if audit_status != "running" or audit_source != spec.id or audit_hash != content_hash:
+            if audit_status != "running":
+                return False
+            running_run = True
+            if audit_source != spec.id or audit_hash != content_hash:
                 return False
             if parsed <= 0 or stored != parsed or rejected:
                 raise ValueError("replacement corpus was incomplete")
@@ -505,6 +509,9 @@ def activate_documents(run_id: int, spec: SourceSpec, content_hash: str,
             )
         return True
     except Exception as exc:
+        if not running_run:
+            print(f"Could not inspect document activation: {exc}")
+            return False
         failure_error = f"activation failed: {exc}"
         try:
             fail_ingestion(run_id, failure_error, parsed, stored, rejected)
