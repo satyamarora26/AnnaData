@@ -36,7 +36,7 @@ def _scheme_names() -> list[str]:
     try:
         with db.connection() as conn:
             rows = conn.execute(
-                "SELECT DISTINCT title, source FROM documents"
+                "SELECT DISTINCT title, source FROM documents WHERE active = TRUE"
             ).fetchall()
     except Exception:
         return []
@@ -53,6 +53,21 @@ def _scheme_names() -> list[str]:
             if key in text.lower():
                 names.add(label)
     return sorted(names)
+
+
+def _active_document_tiers() -> dict[str, int]:
+    """Count only the source material currently eligible for retrieval."""
+    if not db.is_available():
+        return {}
+    try:
+        with db.connection() as conn:
+            rows = conn.execute(
+                """SELECT tier, count(*) FROM documents
+                     WHERE active = TRUE GROUP BY tier"""
+            ).fetchall()
+    except Exception:
+        return {}
+    return {tier: count for tier, count in rows}
 
 
 def capabilities() -> list[str]:
@@ -162,12 +177,21 @@ def data_sources() -> list[str]:
             "India on data.gov.in."
         )
 
-    schemes = _scheme_names()
-    if schemes:
+    document_tiers = _active_document_tiers()
+    if document_tiers:
         sources.append(
-            "Schemes: official guidance documents where available, and "
-            "publicly available reference material otherwise. The answer says "
-            "which kind it used."
+            f"Official documents ({document_tiers.get('official', 0)} active): "
+            "issued by the responsible government authority."
+        )
+        sources.append(
+            f"Extension guidance ({document_tiers.get('extension', 0)} active): "
+            "from state agricultural institutions and used only inside its "
+            "declared state and crop scope."
+        )
+        sources.append(
+            f"Reference material ({document_tiers.get('reference', 0)} active): "
+            "supplementary public information. Answers identify the authority "
+            "and tier used."
         )
 
     provider = "Google Maps" if config.LOCATION_API_KEY else "OpenStreetMap"

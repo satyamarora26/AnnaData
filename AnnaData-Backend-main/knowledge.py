@@ -24,10 +24,11 @@ from dataclasses import asdict
 
 import db
 from config import GEMINI_API_KEY, RAG_MIN_SIMILARITY
-from source_catalog import SourceSpec
+from source_catalog import SourceSpec, scope_score
 
 EMBED_MODEL = "gemini-embedding-001"
 EMBED_DIM = 768
+TIER_PRIORITY = {"official": 2, "extension": 1, "reference": 0}
 
 SCHEMA = f"""
 CREATE EXTENSION IF NOT EXISTS vector;
@@ -584,31 +585,66 @@ def latest_ingestion() -> dict | None:
     rows = recent_ingestions(1)
     return rows[0] if rows else None
 
-def search(query: str, limit: int = 5) -> list[dict]:
-    """Passages most similar to the query, with their sources."""
+def rank_passages(passages: list[dict], state: str | None, crop: str | None,
+                  limit: int = 5, min_similarity: float | None = None) -> list[dict]:
+    """Keep only relevant, in-scope evidence and order it deterministically."""
+    threshold = RAG_MIN_SIMILARITY if min_similarity is None else min_similarity
+    ranked = []
+    for passage in passages:
+        if passage.get("similarity", 0) < threshold:
+            continue
+        match = scope_score(passage.get("scope") or {}, state, crop)
+        if match is None:
+            continue
+        ranked.append((match, TIER_PRIORITY.get(passage.get("tier"), -1),
+                       passage.get("similarity", 0), passage))
+    ranked.sort(key=lambda item: item[:3], reverse=True)
+    return [item[3] for item in ranked[:limit]]
+
+
+def _scope_dict(scope) -> dict:
+    if isinstance(scope, dict):
+        return scope
+    if isinstance(scope, str):
+        try:
+            value = json.loads(scope)
+        except json.JSONDecodeError:
+            return {}
+        return value if isinstance(value, dict) else {}
+    return {}
+
+
+def search(query: str, state: str | None = None, crop: str | None = None,
+           topic: str | None = None, candidate_limit: int = 20,
+           limit: int = 5) -> list[dict]:
+    """Return active, scoped passages most useful for the farmer's question."""
     if not query or not db.is_available():
         return []
     vector = embed(query)
     if vector is None:
         return []
+    candidate_limit = max(1, min(candidate_limit, 100))
     try:
         with db.connection() as conn:
             rows = conn.execute(
                 """
-                SELECT content, source, title, url, tier,
+                SELECT content, source, title, url, authority, tier, scope, topics,
                        1 - (embedding <=> %s::vector) AS similarity
                   FROM documents
                  WHERE active = TRUE AND embedding IS NOT NULL
+                   AND (%s IS NULL OR %s = ANY(topics))
               ORDER BY embedding <=> %s::vector
                  LIMIT %s
                 """,
-                (str(vector), str(vector), limit),
+                (str(vector), topic, topic, str(vector), candidate_limit),
             ).fetchall()
-        return [
-            {"content": c, "source": s, "title": t, "url": u,
-             "tier": tier, "similarity": sim}
-            for c, s, t, u, tier, sim in rows
+        passages = [
+            {"content": content, "source": source, "title": title, "url": url,
+             "authority": authority, "tier": tier, "scope": _scope_dict(scope),
+             "topics": topics, "similarity": similarity}
+            for content, source, title, url, authority, tier, scope, topics, similarity in rows
         ]
+        return rank_passages(passages, state, crop, limit=limit)
     except Exception as e:
         print(f"Knowledge search failed: {e}")
         return []
@@ -654,8 +690,11 @@ def format_passages(passages: list[dict], min_similarity: float = None) -> str:
     ]
     for p in useful:
         text = " ".join(p["content"].split())
-        mark = "OFFICIAL" if p.get("tier") == "official" else "NOT OFFICIAL"
-        lines.append(f"- [{mark} | {p['source']}] {text}")
+        tier = str(p.get("tier") or "reference").upper()
+        authority = p.get("authority") or p.get("source") or "Unknown authority"
+        title = p.get("title") or p.get("source") or "Untitled source"
+        url = p.get("url") or "No source URL recorded"
+        lines.append(f"- [{tier} | {authority} | {title} | {url}] {text}")
 
     if official:
         lines.append(

@@ -19,7 +19,7 @@ TOOLS_FOR_INTENT = {
     # registration authority actually approved.
     "disease_pest":         {"weather", "doses"},  # humidity and rain drive disease pressure
     "sowing_planting":      {"weather", "soil"},
-    "fertiliser_nutrition": {"soil", "weather"},
+    "fertiliser_nutrition": {"soil", "weather", "kb"},
     "irrigation_water":     {"weather"},
     "weather_query":        {"weather"},
     # MSP alongside the live rate, not instead of it: the guaranteed floor is

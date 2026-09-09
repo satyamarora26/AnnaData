@@ -425,12 +425,14 @@ def get_farming_advice(location, state, crop, gathered, farmer_query,
         f"- State: {state or 'unknown'}",
         f"- Crop: {crop or 'unknown'}",
     ]
+    public_gathered = {key: value for key, value in gathered.items()
+                       if not key.startswith("_")}
     for label, key in (("APPROVED PESTICIDE USES", "doses"),
                        ("Soil", "soil"), ("Weather", "weather"),
                        ("Mandi Price", "mandi"),
                        ("MINIMUM SUPPORT PRICE", "msp"),
                        ("Knowledge Base", "kb")):
-        value = gathered.get(key)
+        value = public_gathered.get(key)
         if value:
             context_lines.append(f"- {label}: {value}")
     context = "\n    ".join(context_lines)
@@ -455,6 +457,7 @@ def get_farming_advice(location, state, crop, gathered, farmer_query,
     - NEVER name a price scheme you have no figure for. If there is no MINIMUM SUPPORT PRICE section above, then you do not have the support price for this crop: say plainly that you do not have it and name who does - the local APMC mandi, a cooperative sugar mill for sugarcane. Do NOT mention MSP, FRP, "Fair and Remunerative Price", "government support price" or "a reliable floor" as though it were an answer while quoting no number, and never invite the farmer to go and look it up themselves as a substitute for answering. A named scheme with no figure attached is worse than admitting you do not have it.
     - PRICES: the mandi rate and the Minimum Support Price answer different questions and are not interchangeable. If a MINIMUM SUPPORT PRICE section is present, give that figure - it is current for the whole marketing year and is a real answer, not a substitute for one. When the live mandi rate is unavailable, say so in a few words and then give the support price as the floor the farmer is guaranteed; do not end on "unavailable" while the support price is sitting in the Context. Never present the support price as today's market rate, and never quote a support price that is not in the Context - most vegetables have none.
     - Do not invent facts beyond the given data.
+    - When giving a scheme amount or deadline, MSP, or fertiliser quantity from the Knowledge Base, name the cited authority in the same sentence or the next sentence.
     - CHEMICALS AND DOSES: if an APPROVED PESTICIDE USES section is present, you may name a pesticide and a dose ONLY if it appears there, quoted exactly, and you should say it is a registered use. If that section says nothing is registered, or warns the listed uses are for a different pest, then name NO chemical and NO dose at all - say you have no approved treatment on record and tell them to ask their Krishi Vigyan Kendra or agriculture officer. Never fall back on a chemical you happen to know. But do NOT stop at the refusal: give at least one practical PEST-CONTROL measure that needs no registered product - destroying and removing affected plant material, field sanitation, pheromone or bait traps, bagging fruit, collecting and burying fallen fruit, crop rotation, resistant varieties, adjusting sowing or irrigation timing, hand-picking at low infestation. These carry no chemical risk and are often what the extension officer would advise first. A refusal that offers nothing is a wasted message to a farmer whose crop is being eaten. This applies ONLY to pest and disease control. It is NOT licence to elaborate on any other refusal: where a scheme, subsidy or price is not in the Context, state that plainly and add no figures, percentages or eligibility rules of your own.
     - WHEN THE FARMER SAYS THEY CANNOT DO WHAT YOU SUGGESTED - no animals for dung, no irrigation, no money for a product, no tractor - that is not the end of the conversation and it is not a reason to start over. Do not repeat the suggestion they just ruled out, and do not ask a fresh unrelated question. Give them the next best option that fits what they DO have: compost can be bought or made from crop residue alone, green manure can be grown, a neighbour's dairy sells dung. Name the alternative in the same breath as acknowledging the constraint.
     - End with ONE short, specific question only where the answer would genuinely change with it - the crop stage, how widespread the damage is, whether they have irrigation. Never ask for something already given above. If nothing useful is missing, end with the advice.
@@ -469,7 +472,7 @@ def get_farming_advice(location, state, crop, gathered, farmer_query,
     return llm.invoke([HumanMessage(content=prompt)]).content
 
 
-def gather(tools, *, lat, lon, state, crop, query, pest=None) -> dict:
+def gather(tools, *, lat, lon, state, crop, query, intent, pest=None) -> dict:
     """Run the selected tools concurrently.
 
     They are independent network calls, so running them in sequence meant the
@@ -479,13 +482,23 @@ def gather(tools, *, lat, lon, state, crop, query, pest=None) -> dict:
     if not tools:
         return {}
 
+    def dose_lookup():
+        result = knowledge.approved_uses(crop, pest)
+        return knowledge.format_uses(result, pest), result
+
+    def knowledge_lookup():
+        passages = knowledge.search(
+            query, state=state, crop=crop, topic=intent, candidate_limit=20, limit=5,
+        )
+        if passages or knowledge.documents_loaded():
+            return knowledge.format_passages(passages), passages
+        return query_kb(query), []
+
     calls = {
         # Registered uses come from a table, not a model. The result carries
         # whether the pest actually matched, because a use for a different pest
         # must never be offered as an answer for this one.
-        "doses":   lambda: knowledge.format_uses(
-            knowledge.approved_uses(crop, pest), pest
-        ),
+        "doses":   dose_lookup,
         "soil":    lambda: soil_tool(lat, lon),
         "weather": lambda: weather_openmeteo(lat, lon),
         "mandi":   lambda: get_state_data(state, crop),
@@ -493,8 +506,7 @@ def gather(tools, *, lat, lon, state, crop, query, pest=None) -> dict:
         # Retrieval runs against the local pgvector store. The Bedrock path is
         # kept as a fallback for anyone who has that configured, but it is no
         # longer what the feature depends on.
-        "kb":      lambda: knowledge.format_passages(knowledge.search(query))
-                   if knowledge.documents_loaded() else query_kb(query),
+        "kb":      knowledge_lookup,
     }
 
     results = {}
@@ -503,7 +515,15 @@ def gather(tools, *, lat, lon, state, crop, query, pest=None) -> dict:
         for future in as_completed(futures):
             name = futures[future]
             try:
-                results[name] = future.result()
+                value = future.result()
+                if name == "doses":
+                    results[name], dose_result = value
+                    if dose_result.get("pest_matched"):
+                        results["_dose_records"] = dose_result.get("uses") or []
+                elif name == "kb":
+                    results[name], results["_kb_passages"] = value
+                else:
+                    results[name] = value
             except Exception as e:
                 print(f"Tool {name} failed: {e}")
     return results
@@ -679,7 +699,8 @@ def run_agent(
         )
 
     gathered = gather(tools, lat=lat, lon=lon, state=facts["state"], crop=facts["crop"],
-                      query=query_final, pest=_known(structured_input.get("pest")))
+                      query=query_final, intent=intent,
+                      pest=_known(structured_input.get("pest")))
 
     final_response = extract_markdown_content(
         get_farming_advice(facts["location"], facts["state"], facts["crop"],
@@ -692,7 +713,7 @@ def run_agent(
         print("Removed an unsupported figure from the answer")
     print(f"Final response: {final_response}")
     return AgentResult(
-        final_response, tools_used=sorted(gathered.keys()),
+        final_response, tools_used=sorted(tools),
         missing_slots=missing, intent=intent, **facts
     )
 
