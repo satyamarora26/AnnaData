@@ -18,9 +18,11 @@ Both live in the Postgres already provisioned for farmer profiles, so this adds
 no infrastructure and no cost.
 """
 import json
+import math
 import re
 import urllib.request
 from dataclasses import asdict
+from urllib.parse import urlsplit
 
 import db
 from config import GEMINI_API_KEY, RAG_MIN_SIMILARITY
@@ -589,29 +591,97 @@ def rank_passages(passages: list[dict], state: str | None, crop: str | None,
                   limit: int = 5, min_similarity: float | None = None) -> list[dict]:
     """Keep only relevant, in-scope evidence and order it deterministically."""
     threshold = RAG_MIN_SIMILARITY if min_similarity is None else min_similarity
+    limit = _bounded_int(limit, default=5, minimum=0, maximum=5)
     ranked = []
     for passage in passages:
-        if passage.get("similarity", 0) < threshold:
+        prepared = _prepared_passage(passage)
+        if prepared is None:
             continue
-        match = scope_score(passage.get("scope") or {}, state, crop)
+        try:
+            similarity = float(prepared.get("similarity", 0))
+        except (TypeError, ValueError):
+            continue
+        if not math.isfinite(similarity) or similarity < threshold:
+            continue
+        match = scope_score(prepared["scope"], state, crop)
         if match is None:
             continue
-        ranked.append((match, TIER_PRIORITY.get(passage.get("tier"), -1),
-                       passage.get("similarity", 0), passage))
-    ranked.sort(key=lambda item: item[:3], reverse=True)
+        ranked.append((match, TIER_PRIORITY[prepared["tier"]], similarity, prepared))
+    ranked.sort(key=lambda item: (-item[0], -item[1], -item[2],
+                                  _metadata_sort_key(item[3])))
     return [item[3] for item in ranked[:limit]]
 
 
-def _scope_dict(scope) -> dict:
+def _bounded_int(value, *, default: int, minimum: int, maximum: int) -> int:
+    try:
+        value = int(value)
+    except (TypeError, ValueError):
+        value = default
+    return max(minimum, min(value, maximum))
+
+
+def _scope_dict(scope) -> dict | None:
+    """Decode only valid scope objects; invalid values are not unscoped evidence."""
+    if scope is None:
+        return {}
     if isinstance(scope, dict):
-        return scope
-    if isinstance(scope, str):
+        value = scope
+    elif isinstance(scope, str):
         try:
             value = json.loads(scope)
         except json.JSONDecodeError:
-            return {}
-        return value if isinstance(value, dict) else {}
-    return {}
+            return None
+    else:
+        return None
+    if not isinstance(value, dict):
+        return None
+    for key in ("states", "crops"):
+        declared = value.get(key)
+        if declared is not None and (
+            not isinstance(declared, (list, tuple))
+            or any(not isinstance(item, str) or not item.strip() for item in declared)
+        ):
+            return None
+    return value
+
+
+def _clean_citation_text(value) -> str | None:
+    if not isinstance(value, str):
+        return None
+    text = " ".join(value.replace("|", "/").replace("[", "(").replace("]", ")").split())
+    return text or None
+
+
+def _clean_citation_url(value) -> str | None:
+    if not isinstance(value, str):
+        return None
+    url = "".join(value.split()).replace("|", "%7C").replace("[", "%5B").replace("]", "%5D")
+    parsed = urlsplit(url)
+    if parsed.scheme.casefold() != "https" or not parsed.netloc:
+        return None
+    return url
+
+
+def _prepared_passage(passage) -> dict | None:
+    """Return safe evidence metadata or reject a row before it reaches a prompt."""
+    if not isinstance(passage, dict) or "scope" not in passage:
+        return None
+    scope = _scope_dict(passage["scope"])
+    authority = _clean_citation_text(passage.get("authority"))
+    title = _clean_citation_text(passage.get("title"))
+    url = _clean_citation_url(passage.get("url"))
+    tier = str(passage.get("tier") or "").casefold()
+    content = passage.get("content")
+    if (scope is None or not authority or not title or not url
+            or tier not in TIER_PRIORITY or not isinstance(content, str) or not content.strip()):
+        return None
+    return {**passage, "scope": scope, "authority": authority, "title": title,
+            "url": url, "tier": tier}
+
+
+def _metadata_sort_key(passage: dict) -> tuple[str, ...]:
+    return tuple(str(passage.get(key) or "").casefold()
+                 for key in ("source", "authority", "title", "url", "content"))
 
 
 def search(query: str, state: str | None = None, crop: str | None = None,
@@ -623,7 +693,7 @@ def search(query: str, state: str | None = None, crop: str | None = None,
     vector = embed(query)
     if vector is None:
         return []
-    candidate_limit = max(1, min(candidate_limit, 100))
+    candidate_limit = _bounded_int(candidate_limit, default=20, minimum=1, maximum=100)
     try:
         with db.connection() as conn:
             rows = conn.execute(
@@ -632,7 +702,7 @@ def search(query: str, state: str | None = None, crop: str | None = None,
                        1 - (embedding <=> %s::vector) AS similarity
                   FROM documents
                  WHERE active = TRUE AND embedding IS NOT NULL
-                   AND (%s IS NULL OR %s = ANY(topics))
+                   AND (%s::text IS NULL OR %s = ANY(topics))
               ORDER BY embedding <=> %s::vector
                  LIMIT %s
                 """,
@@ -658,7 +728,18 @@ def format_passages(passages: list[dict], min_similarity: float = None) -> str:
     retrieval turns into a more confident kind of guess.
     """
     threshold = RAG_MIN_SIMILARITY if min_similarity is None else min_similarity
-    useful = [p for p in passages if p.get("similarity", 0) >= threshold]
+    useful = []
+    for passage in passages:
+        prepared = _prepared_passage(passage)
+        if prepared is None:
+            continue
+        try:
+            similarity = float(prepared.get("similarity", 0))
+        except (TypeError, ValueError):
+            continue
+        if math.isfinite(similarity) and similarity >= threshold:
+            useful.append(prepared)
+    useful = useful[:5]
     if not useful:
         # Refusing without saying what IS available is the unhelpful half of
         # honesty. A farmer asking generally about "welfare schemes" matches
@@ -677,8 +758,6 @@ def format_passages(passages: list[dict], min_similarity: float = None) -> str:
                 "relevant, say so and point the farmer to their agriculture "
                 "office.")
 
-    official = [p for p in useful if p.get("tier") == "official"]
-
     lines = [
         "Reference material. Read it before answering, and note that similarity "
         "search returns the closest passages whether or not they are relevant.",
@@ -690,24 +769,15 @@ def format_passages(passages: list[dict], min_similarity: float = None) -> str:
     ]
     for p in useful:
         text = " ".join(p["content"].split())
-        tier = str(p.get("tier") or "reference").upper()
-        authority = p.get("authority") or p.get("source") or "Unknown authority"
-        title = p.get("title") or p.get("source") or "Untitled source"
-        url = p.get("url") or "No source URL recorded"
-        lines.append(f"- [{tier} | {authority} | {title} | {url}] {text}")
+        lines.append(f"- [{p['tier'].upper()} | {p['authority']} | {p['title']} | {p['url']}] {text}")
 
-    if official:
-        lines.append(
-            "\nWhere sources disagree, prefer the OFFICIAL ones."
-        )
-    else:
-        lines.append(
-            "\nNone of the above is an official government document. You may "
-            "answer from it, but say the details are indicative and tell the "
-            "farmer to confirm with their agriculture office or the scheme's "
-            "official portal before acting on a date, an amount or an "
-            "eligibility rule."
-        )
+    lines.append(
+        "\nUse a passage only when its declared state and crop scope applies. "
+        "A matching scoped EXTENSION passage can be more useful than unscoped "
+        "central material for local practice. Among equally applicable passages, "
+        "prefer OFFICIAL material. REFERENCE material never authorizes a scheme "
+        "amount, deadline, MSP, or fertiliser quantity."
+    )
     return "\n".join(lines)
 
 
