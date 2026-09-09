@@ -427,15 +427,43 @@ def stage_document(run_id: int, spec: SourceSpec, content_hash: str,
 def activate_documents(run_id: int, spec: SourceSpec, content_hash: str,
                        parsed: int, stored: int, rejected: int) -> bool:
     """Atomically replace a source only when every parsed chunk was staged."""
-    if parsed <= 0 or stored != parsed or rejected:
-        fail_ingestion(run_id, "replacement corpus was incomplete", parsed, stored, rejected)
-        return False
     try:
         with db.connection() as conn:
             conn.execute(
                 "SELECT pg_advisory_xact_lock(hashtext(%s))",
                 (spec.id,),
             )
+            audit = conn.execute(
+                """SELECT source, content_hash, status, parsed_count, stored_count,
+                          rejected_count
+                     FROM ingestion_runs WHERE id = %s FOR UPDATE""",
+                (run_id,),
+            ).fetchone()
+            if audit is None:
+                return False
+            (audit_source, audit_hash, audit_status, audit_parsed, audit_stored,
+             audit_rejected) = audit
+            if audit_status == "completed":
+                if (audit_source != spec.id or audit_hash != content_hash
+                        or audit_parsed != parsed or audit_stored != stored
+                        or audit_rejected != rejected or parsed <= 0
+                        or stored != parsed or rejected):
+                    return False
+                active_count, owned_active_count = conn.execute(
+                    """SELECT count(*) AS active_count,
+                              count(*) FILTER (
+                                  WHERE ingestion_run_id = %s AND source = %s
+                                    AND content_hash = %s
+                              ) AS owned_active_count
+                         FROM documents
+                        WHERE source = %s AND active = TRUE""",
+                    (run_id, spec.id, content_hash, spec.id),
+                ).fetchone()
+                return active_count == stored and owned_active_count == stored
+            if audit_status != "running" or audit_source != spec.id or audit_hash != content_hash:
+                return False
+            if parsed <= 0 or stored != parsed or rejected:
+                raise ValueError("replacement corpus was incomplete")
             staged_count, owned_count = conn.execute(
                 """SELECT count(*) AS staged_count,
                           count(*) FILTER (
