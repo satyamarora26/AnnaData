@@ -57,6 +57,8 @@ def test_msp_parser_keeps_declared_prices_and_drops_dash():
 def test_msp_replace_deletes_only_selected_year_then_upserts_every_alias(monkeypatch):
     connection = RecordingConnection()
     audit_calls = []
+    monkeypatch.setattr(msp.db, "is_available", lambda: True)
+    monkeypatch.setattr(msp.knowledge, "init", lambda: True)
     monkeypatch.setattr(msp, "init", lambda: True)
     monkeypatch.setattr(msp.db, "connection", lambda: nullcontext(connection))
     monkeypatch.setattr(
@@ -83,10 +85,56 @@ def test_msp_replace_deletes_only_selected_year_then_upserts_every_alias(monkeyp
     assert audit_calls[0][-1] is False
 
 
+def test_msp_replace_initializes_fresh_storage_before_audit_and_replacement(monkeypatch):
+    events = []
+    storage = {"available": False}
+
+    class FreshProcessConnection(RecordingConnection):
+        def execute(self, sql, params=()):
+            compact = " ".join(sql.split())
+            if "CREATE TABLE IF NOT EXISTS commodity_msp" in compact:
+                events.append("msp schema")
+            elif compact == "DELETE FROM commodity_msp WHERE year = %s":
+                events.append("replacement")
+            return super().execute(sql, params)
+
+    connection = FreshProcessConnection()
+
+    def initialize_database():
+        events.append("db init")
+        storage["available"] = True
+        return True
+
+    def initialize_knowledge():
+        events.append("knowledge init")
+        return True
+
+    def start_audit(*args, **kwargs):
+        assert events == ["db init", "knowledge init", "msp schema"]
+        events.append("audit")
+        return 41
+
+    monkeypatch.setattr(msp.db, "is_available", lambda: storage["available"])
+    monkeypatch.setattr(msp.db, "init", initialize_database)
+    monkeypatch.setattr(msp.db, "connection", lambda: nullcontext(connection))
+    monkeypatch.setattr(msp.knowledge, "init", initialize_knowledge)
+    monkeypatch.setattr(msp.knowledge, "start_ingestion", start_audit)
+
+    result = msp.replace_csv(
+        str(FIXTURE), "2026-27", "Reviewed MSP", "https://agmarknet.gov.in/msp.csv"
+    )
+
+    assert result["aliases"] == 5
+    assert events == ["db init", "knowledge init", "msp schema", "audit", "replacement"]
+
+
 def test_msp_empty_parse_records_failure_without_opening_replacement_transaction(tmp_path, monkeypatch):
     empty = tmp_path / "empty.csv"
     empty.write_text("Group,Commodity,MSP,Unit\nVegetables,Onion,-,Rs/Quintal\n", encoding="utf-8")
     failures = []
+    monkeypatch.setattr(msp.db, "is_available", lambda: True)
+    monkeypatch.setattr(msp.knowledge, "init", lambda: True)
+    monkeypatch.setattr(msp, "init", lambda: True)
     monkeypatch.setattr(msp.knowledge, "record_ingestion_failure", lambda *args: failures.append(args))
     monkeypatch.setattr(msp.db, "connection", lambda: pytest.fail("empty input must not open a transaction"))
 
@@ -94,6 +142,21 @@ def test_msp_empty_parse_records_failure_without_opening_replacement_transaction
         msp.replace_csv(str(empty), "2026-27", "Reviewed MSP", "https://agmarknet.gov.in/msp.csv")
 
     assert failures and failures[0][:3] == ("msp", "msp:2026-27", "https://agmarknet.gov.in/msp.csv")
+
+
+def test_msp_does_not_claim_a_failed_audit_when_storage_cannot_initialize(monkeypatch):
+    monkeypatch.setattr(msp.db, "is_available", lambda: False)
+    monkeypatch.setattr(msp.db, "init", lambda: False)
+    monkeypatch.setattr(
+        msp.knowledge,
+        "record_ingestion_failure",
+        lambda *args: pytest.fail("storage initialization failure must not claim an audit"),
+    )
+
+    with pytest.raises(RuntimeError, match="could not initialize database"):
+        msp.replace_csv(
+            str(FIXTURE), "2026-27", "Reviewed MSP", "https://agmarknet.gov.in/msp.csv"
+        )
 
 
 def test_msp_rejects_non_official_source_without_initializing_the_database(monkeypatch):

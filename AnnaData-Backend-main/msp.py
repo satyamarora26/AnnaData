@@ -116,28 +116,36 @@ def is_official_source_url(value: str) -> bool:
     return parsed.scheme == "https" and (host == "gov.in" or host.endswith(".gov.in"))
 
 
+def _initialize_storage() -> None:
+    """Prepare every table needed before creating an MSP audit or replacement."""
+    if not db.is_available() and not db.init():
+        raise RuntimeError("could not initialize database for MSP load")
+    if not db.is_available():
+        raise RuntimeError("could not initialize database for MSP load")
+    if not knowledge.init():
+        raise RuntimeError("could not initialize knowledge ingestion schema for MSP load")
+    if not init():
+        raise RuntimeError("could not initialize MSP schema for MSP load")
+
+
 def replace_csv(path: str, year: str, source: str, source_url: str) -> dict:
     """Atomically replace one marketing year's reviewed MSP aliases."""
     content = Path(path).read_bytes()
     content_hash = hashlib.sha256(content).hexdigest()
     rows = _parse_csv_bytes(content)
     audit_source = f"msp:{year}"
-    if not rows:
-        knowledge.record_ingestion_failure(
-            "msp", audit_source, source_url, "no valid MSP rows parsed", content_hash
-        )
-        raise ValueError("no valid MSP rows parsed")
     if not is_official_source_url(source_url):
         knowledge.record_ingestion_failure(
             "msp", audit_source, source_url,
             "source URL must use an official HTTPS .gov.in host", content_hash,
         )
         raise ValueError("source URL must use an official HTTPS .gov.in host")
-    if not init():
+    _initialize_storage()
+    if not rows:
         knowledge.record_ingestion_failure(
-            "msp", audit_source, source_url, "MSP table unavailable", content_hash
+            "msp", audit_source, source_url, "no valid MSP rows parsed", content_hash
         )
-        raise RuntimeError("MSP table unavailable")
+        raise ValueError("no valid MSP rows parsed")
 
     run_id = knowledge.start_ingestion(
         "msp", audit_source, source_url, content_hash, skip_completed=False
