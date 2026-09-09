@@ -12,6 +12,9 @@ venv
 __pycache__/
 *.py[cod]
 
+# Downloaded source documents
+AnnaData-Backend-main/data/downloads/
+
 # Node
 node_modules/
 node_modules
