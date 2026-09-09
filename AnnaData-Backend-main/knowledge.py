@@ -20,9 +20,11 @@ no infrastructure and no cost.
 import json
 import re
 import urllib.request
+from dataclasses import asdict
 
 import db
 from config import GEMINI_API_KEY, RAG_MIN_SIMILARITY
+from source_catalog import SourceSpec
 
 EMBED_MODEL = "gemini-embedding-001"
 EMBED_DIM = 768
@@ -51,6 +53,21 @@ CREATE TABLE IF NOT EXISTS pesticide_uses (
 CREATE INDEX IF NOT EXISTS pesticide_crop_pest
     ON pesticide_uses (lower(crop), lower(pest));
 
+CREATE TABLE IF NOT EXISTS ingestion_runs (
+    id              BIGSERIAL PRIMARY KEY,
+    kind            TEXT NOT NULL,
+    source          TEXT NOT NULL,
+    source_url      TEXT,
+    content_hash    TEXT,
+    status          TEXT NOT NULL CHECK (status IN ('running', 'completed', 'failed', 'skipped')),
+    parsed_count    INTEGER NOT NULL DEFAULT 0,
+    stored_count    INTEGER NOT NULL DEFAULT 0,
+    rejected_count  INTEGER NOT NULL DEFAULT 0,
+    error           TEXT,
+    started_at      TIMESTAMPTZ NOT NULL DEFAULT now(),
+    completed_at    TIMESTAMPTZ
+);
+
 -- Reference text for open-ended questions.
 CREATE TABLE IF NOT EXISTS documents (
     id          BIGSERIAL PRIMARY KEY,
@@ -71,6 +88,21 @@ CREATE INDEX IF NOT EXISTS documents_embedding
     ON documents USING hnsw (embedding vector_cosine_ops);
 
 ALTER TABLE documents ADD COLUMN IF NOT EXISTS tier TEXT NOT NULL DEFAULT 'reference';
+ALTER TABLE documents ADD COLUMN IF NOT EXISTS authority TEXT;
+ALTER TABLE documents ADD COLUMN IF NOT EXISTS published_on DATE;
+ALTER TABLE documents ADD COLUMN IF NOT EXISTS retrieved_at TIMESTAMPTZ NOT NULL DEFAULT now();
+ALTER TABLE documents ADD COLUMN IF NOT EXISTS content_hash TEXT;
+ALTER TABLE documents ADD COLUMN IF NOT EXISTS scope JSONB NOT NULL DEFAULT '{{}}';
+ALTER TABLE documents ADD COLUMN IF NOT EXISTS topics TEXT[] NOT NULL DEFAULT '{{}}';
+ALTER TABLE documents ADD COLUMN IF NOT EXISTS ingestion_run_id BIGINT;
+ALTER TABLE documents ADD COLUMN IF NOT EXISTS active BOOLEAN NOT NULL DEFAULT TRUE;
+
+CREATE UNIQUE INDEX IF NOT EXISTS documents_source_hash_chunk
+    ON documents (source, content_hash, chunk_index)
+    WHERE content_hash IS NOT NULL;
+CREATE INDEX IF NOT EXISTS documents_active_embedding
+    ON documents USING hnsw (embedding vector_cosine_ops)
+    WHERE active = TRUE;
 """
 
 
@@ -336,6 +368,150 @@ def format_uses(result: dict, pest: str | None = None) -> str:
 
 # --- reference text ---------------------------------------------------------
 
+def start_ingestion(kind: str, source: str, source_url: str,
+                    content_hash: str) -> int | None:
+    """Create an auditable ingestion run unless this content is already live."""
+    if not db.is_available():
+        raise RuntimeError("database unavailable during ingestion")
+    with db.connection() as conn:
+        if kind == "document":
+            prior = conn.execute(
+                """SELECT 1 FROM documents
+                     WHERE source = %s AND content_hash = %s AND active = TRUE
+                     LIMIT 1""",
+                (source, content_hash),
+            ).fetchone()
+        else:
+            prior = conn.execute(
+                """SELECT 1 FROM ingestion_runs
+                     WHERE kind = %s AND source = %s AND content_hash = %s
+                       AND status = 'completed' LIMIT 1""",
+                (kind, source, content_hash),
+            ).fetchone()
+        status = "skipped" if prior else "running"
+        row = conn.execute(
+            """INSERT INTO ingestion_runs
+                   (kind, source, source_url, content_hash, status, completed_at)
+                 VALUES (%s, %s, %s, %s, %s,
+                         CASE WHEN %s = 'skipped' THEN now() ELSE NULL END)
+              RETURNING id""",
+            (kind, source, source_url, content_hash, status, status),
+        ).fetchone()
+    return None if prior else row[0]
+
+
+def stage_document(run_id: int, spec: SourceSpec, content_hash: str,
+                   content: str, chunk_index: int,
+                   embedding: list[float]) -> bool:
+    """Write an inactive document chunk that can be published as a complete set."""
+    try:
+        with db.connection() as conn:
+            conn.execute(
+                """INSERT INTO documents
+                       (source, title, url, authority, tier, published_on, scope,
+                        topics, content_hash, ingestion_run_id, active,
+                        chunk_index, content, embedding)
+                     VALUES (%s, %s, %s, %s, %s, %s, %s::jsonb, %s, %s, %s,
+                             FALSE, %s, %s, %s::vector)""",
+                (spec.id, spec.title, spec.source_url, spec.authority, spec.tier,
+                 spec.published_on, json.dumps(asdict(spec)["scope"]),
+                 list(spec.topics), content_hash, run_id, chunk_index, content,
+                 str(embedding)),
+            )
+        return True
+    except Exception as exc:
+        print(f"Could not stage document: {exc}")
+        return False
+
+
+def activate_documents(run_id: int, spec: SourceSpec, content_hash: str,
+                       parsed: int, stored: int, rejected: int) -> bool:
+    """Atomically replace a source only when every parsed chunk was staged."""
+    if parsed <= 0 or stored != parsed or rejected:
+        fail_ingestion(run_id, "replacement corpus was incomplete", parsed, stored, rejected)
+        return False
+    with db.connection() as conn:
+        conn.execute(
+            "UPDATE documents SET active = FALSE WHERE source = %s AND active = TRUE",
+            (spec.id,),
+        )
+        conn.execute(
+            "UPDATE documents SET active = TRUE WHERE ingestion_run_id = %s",
+            (run_id,),
+        )
+        conn.execute(
+            "DELETE FROM documents WHERE source = %s AND active = FALSE",
+            (spec.id,),
+        )
+        conn.execute(
+            """UPDATE ingestion_runs
+                  SET status = 'completed', parsed_count = %s, stored_count = %s,
+                      rejected_count = %s, completed_at = now()
+                WHERE id = %s""",
+            (parsed, stored, rejected, run_id),
+        )
+    return True
+
+
+def fail_ingestion(run_id: int, error: str, parsed: int = 0,
+                   stored: int = 0, rejected: int = 0) -> None:
+    """Discard incomplete staged chunks and preserve their audit outcome."""
+    with db.connection() as conn:
+        conn.execute(
+            "DELETE FROM documents WHERE ingestion_run_id = %s AND active = FALSE",
+            (run_id,),
+        )
+        conn.execute(
+            """UPDATE ingestion_runs SET status = 'failed', error = %s,
+                      parsed_count = %s, stored_count = %s, rejected_count = %s,
+                      completed_at = now() WHERE id = %s""",
+            (error[:2000], parsed, stored, rejected, run_id),
+        )
+
+
+def record_ingestion_failure(kind: str, source: str, source_url: str,
+                             error: str, content_hash: str | None = None) -> None:
+    """Record an ingestion failure that occurred before a run could start."""
+    if not db.is_available():
+        return
+    with db.connection() as conn:
+        conn.execute(
+            """INSERT INTO ingestion_runs
+                   (kind, source, source_url, content_hash, status, error, completed_at)
+                 VALUES (%s, %s, %s, %s, 'failed', %s, now())""",
+            (kind, source, source_url, content_hash, error[:2000]),
+        )
+
+
+def recent_ingestions(limit: int = 5) -> list[dict]:
+    """Return a bounded newest-first view of terminal ingestion audit rows."""
+    if not db.is_available():
+        return []
+    limit = max(1, min(limit, 100))
+    try:
+        with db.connection() as conn:
+            rows = conn.execute(
+                """SELECT id, kind, source, status, parsed_count, stored_count,
+                          rejected_count, error, completed_at
+                     FROM ingestion_runs
+                    WHERE status IN ('completed', 'failed', 'skipped')
+                 ORDER BY completed_at DESC, id DESC
+                    LIMIT %s""",
+                (limit,),
+            ).fetchall()
+    except Exception as exc:
+        print(f"Could not read ingestion audit: {exc}")
+        return []
+    keys = ("id", "kind", "source", "status", "parsed_count", "stored_count",
+            "rejected_count", "error", "completed_at")
+    return [dict(zip(keys, row)) for row in rows]
+
+
+def latest_ingestion() -> dict | None:
+    """Return the newest terminal ingestion audit row, if one exists."""
+    rows = recent_ingestions(1)
+    return rows[0] if rows else None
+
 def search(query: str, limit: int = 5) -> list[dict]:
     """Passages most similar to the query, with their sources."""
     if not query or not db.is_available():
@@ -350,7 +526,7 @@ def search(query: str, limit: int = 5) -> list[dict]:
                 SELECT content, source, title, url, tier,
                        1 - (embedding <=> %s::vector) AS similarity
                   FROM documents
-                 WHERE embedding IS NOT NULL
+                 WHERE active = TRUE AND embedding IS NOT NULL
               ORDER BY embedding <=> %s::vector
                  LIMIT %s
                 """,
@@ -430,7 +606,9 @@ def covered_topics() -> list[str]:
         return []
     try:
         with db.connection() as conn:
-            rows = conn.execute("SELECT DISTINCT title, source FROM documents").fetchall()
+            rows = conn.execute(
+                "SELECT DISTINCT title, source FROM documents WHERE active = TRUE"
+            ).fetchall()
     except Exception:
         return []
 
@@ -486,7 +664,9 @@ def counts() -> dict:
     try:
         with db.connection() as conn:
             uses = conn.execute("SELECT count(*) FROM pesticide_uses").fetchone()[0]
-            docs = conn.execute("SELECT count(*) FROM documents").fetchone()[0]
+            docs = conn.execute(
+                "SELECT count(*) FROM documents WHERE active = TRUE"
+            ).fetchone()[0]
         return {"pesticide_uses": uses, "documents": docs}
     except Exception:
         return {"pesticide_uses": 0, "documents": 0}
