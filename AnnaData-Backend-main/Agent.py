@@ -709,10 +709,7 @@ def run_agent(
     )
     # A price or a subsidy is a number a farmer acts on. If nothing retrieved
     # supports it, no sentence claiming one survives, whatever the model wrote.
-    final_response, scrubbed = output_guards.scrub(final_response, gathered)
-    if scrubbed:
-        print("Removed an unsupported figure from the answer")
-    print(f"Final response: {final_response}")
+    final_response, _ = output_guards.scrub(final_response, gathered)
     return AgentResult(
         final_response, tools_used=sorted(tools),
         missing_slots=missing, intent=intent, **facts

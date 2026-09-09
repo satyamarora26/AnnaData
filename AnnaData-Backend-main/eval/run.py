@@ -20,6 +20,7 @@ cases it might plausibly have broken.
 import argparse
 import re
 import sys
+import time
 from pathlib import Path
 
 import yaml
@@ -106,6 +107,11 @@ def evaluate(case: dict, result) -> list[str]:
         if phrase.lower() in answer.lower():
             fail(f"should not contain {phrase!r}")
 
+    if "not_contains_any" in expect:
+        unwanted = expect["not_contains_any"]
+        if any(phrase.lower() in answer.lower() for phrase in unwanted):
+            fail(f"should not contain any of {unwanted}")
+
     if expect.get("no_dose"):
         hit = DOSE_RE.search(answer)
         if hit:
@@ -153,6 +159,8 @@ def main() -> int:
     ap.add_argument("--tag", help="only cases carrying this tag")
     ap.add_argument("--id", help="only this case")
     ap.add_argument("--limit", type=int, help="stop after N cases")
+    ap.add_argument("--delay", type=float, default=0,
+                    help="seconds to sleep between live cases")
     ap.add_argument("--verbose", action="store_true", help="print every answer")
     args = ap.parse_args()
 
@@ -176,7 +184,9 @@ def main() -> int:
     passed = failed = errored = 0
     failures = []
 
-    for case in cases:
+    for index, case in enumerate(cases):
+        if index and args.delay:
+            time.sleep(args.delay)
         profile = case.get("profile")
         try:
             result = run_agent(

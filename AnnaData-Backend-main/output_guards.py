@@ -1,68 +1,83 @@
-"""
-Removing figures the retrieved data does not support.
-
-Twice now a prompt instruction has failed to stop the model stating a number it
-had no basis for, and both times the fix was to check the output in code rather
-than to word the request better.
-
-The first was a support price. Asked for one it did not hold, the model wrote
-"the Fair and Remunerative Price for the 2026-27 season is 340 rupees per
-quintal" - fluent, specific, invented, and produced despite an explicit
-prohibition in the same prompt. The second was a subsidy: retrieval correctly
-reported that it covered nothing about solar pumps, the prompt correctly said to
-invent no amount, and a percentage appeared anyway in two runs out of four.
-
-The pattern is the same both times. A negative constraint expressed in the same
-channel as the generation competes with a fluent continuation, and loses often
-enough to matter. Where a figure will be acted upon - a price a harvest is sold
-against, a subsidy a farmer travels to claim - the constraint belongs in the
-deterministic layer around the model.
-
-Both checks work the same way: a sentence asserting a *scheme or price and a
-number together* is removed when nothing retrieved backs it. Sentences that name
-the thing without a figure survive, because telling a farmer to ask at the sugar
-mill or the district office is useful and true.
-"""
+"""Deterministic checks for figures a farmer could act on."""
+import logging
 import re
 
-# --- what counts as a claim -------------------------------------------------
+
+LOGGER = logging.getLogger(__name__)
 
 PRICE_SCHEME = re.compile(
     r"\b(msp|frp|minimum support price|fair and remunerative|"
     r"support price|procurement price|floor price|samarthan mulya)\b",
     re.I,
 )
-
 WELFARE_SCHEME = re.compile(
     r"\b(scheme|yojana|yojna|subsidy|subsid(?:ies|ised|y)|anudan|"
     r"pm-?kisan|pmfby|kcc|kisan credit card|fasal bima|crop insurance|"
-    r"soil health card|kusum|sarkari yojana)\b",
+    r"soil health card|kusum|sarkari yojana|eligib(?:ility|le))\b",
     re.I,
 )
 
-# A quantity that reads as money or a proportion. Bare digits are deliberately
-# not enough: a helpline number and a district office address both contain them,
-# and removing those sentences would cost the farmer the one useful thing left
-# in a refusal.
+_MATERIAL = (
+    r"zinc\s+(?:sulphate|sulfate)|urea|dap|mop|ssp|potash|nitrogen|"
+    r"phosphorus|potassium|fertili[sz]er|manure|compost"
+)
+_AMOUNT = r"\d+(?:[.,]\d+)?(?:\s*(?:-|–|to)\s*\d+(?:[.,]\d+)?)?"
+_UNIT = r"kg|kgs|kilograms?|g|gm|grams?|l|lit(?:re|er)s?|ml|millilit(?:re|er)s?|tonnes?"
+_BASIS = r"acres?|ha|hectares?|l|lit(?:re|er)s?"
+
+FERTILIZER_SUBJECT = re.compile(rf"\b(?:{_MATERIAL})\b", re.I)
+PESTICIDE_SUBJECT = re.compile(
+    r"\b(?:spray|pesticide|insecticide|fungicide|herbicide|chemical|"
+    r"registered\s+pesticide|dose|use)\b",
+    re.I,
+)
+
+_QUANTITY_WITH_BASIS = re.compile(
+    rf"(?:(?P<before>{_MATERIAL})\s+(?:at\s+)?)?"
+    rf"(?P<amount>{_AMOUNT})\s*(?P<unit>{_UNIT})"
+    rf"(?:\s+(?:of\s+)?(?P<after>{_MATERIAL}))?"
+    rf"\s*(?:per|/)\s*(?P<basis>{_BASIS})\b",
+    re.I,
+)
+_MATERIAL_BEFORE_QUANTITY = re.compile(
+    rf"(?P<material>{_MATERIAL})\s+(?:at\s+)?"
+    rf"(?P<amount>{_AMOUNT})\s*(?P<unit>{_UNIT})\b",
+    re.I,
+)
+_MATERIAL_AFTER_QUANTITY = re.compile(
+    rf"(?P<amount>{_AMOUNT})\s*(?P<unit>{_UNIT})\s+(?:of\s+)?"
+    rf"(?P<material>{_MATERIAL})\b",
+    re.I,
+)
+_WAITING_PERIOD = re.compile(
+    r"\b(?:wait\s+(?P<wait>\d+)\s+days?\s+before\s+harvest|"
+    r"pre-?harvest\s+interval\s+(?:of\s+)?(?P<interval>\d+)\s+days?)\b",
+    re.I,
+)
+_PRODUCT_RECOMMENDATION = re.compile(
+    r"\b(?:spray|apply|use)\s+(?P<product>.+?)"
+    r"(?=\s+(?:at|@|for|on)\b|,|[.!?]|$)",
+    re.I,
+)
+
+_MONEY_PREFIX = re.compile(r"(?:₹|\brs\.?\b|\binr\b)\s*([\d,]+(?:\.\d+)?)", re.I)
+_MONEY_SUFFIX = re.compile(
+    r"\b([\d,]+(?:\.\d+)?)\s*(?:rupees?|rupaye|rupaiya|/-)\b", re.I
+)
+_PERCENTAGE = re.compile(
+    r"\b(\d+(?:\.\d+)?)\s*(?:%|percent|per\s?cent|pratishat)(?=\s|$|[,.!?])",
+    re.I,
+)
 FIGURE = re.compile(
-    r"(?:₹|\brs\.?\b|\binr\b)\s*[\d०-९][\d,०-९]*"
-    r"|[\d०-९][\d,०-९]*\s*(?:%|percent|per\s?cent|pratishat|"
-    r"rupees?|rupaye|rupaiya|lakh|crore|/-)",
+    r"(?:₹|\brs\.?\b|\binr\b)\s*[\d,]+(?:\.\d+)?|"
+    r"\b[\d,]+(?:\.\d+)?\s*%(?=\s|$|[,.!?])|"
+    r"\b[\d,]+(?:\.\d+)?\s*(?:percent|per\s?cent|pratishat|rupees?|rupaye|rupaiya|/-)\b",
     re.I,
 )
 
-# Retrieval says this, verbatim, when nothing it found addresses the question.
-KB_UNCOVERED = "The passages retrieved do not answer this specific question"
-
-PRICE_FALLBACK = (
-    "I do not have the official support price for this crop on record. "
-    "Your local APMC mandi can give you the current rate, and for sugarcane "
-    "the cooperative sugar mill publishes the price it pays."
-)
-SCHEME_FALLBACK = (
-    "I do not have the amounts or eligibility rules for that scheme on record. "
-    "Your district agriculture office or nearest Krishi Vigyan Kendra can give "
-    "you the current figures."
+ACTION_FALLBACK = (
+    "Please contact your nearest Krishi Vigyan Kendra or agriculture officer "
+    "for a verified recommendation."
 )
 
 
@@ -70,49 +85,188 @@ def _sentences(text: str) -> list[str]:
     return re.split(r"(?<=[.!?।])\s+", text)
 
 
-def _strip(answer: str, subject: re.Pattern, fallback: str) -> tuple[str, bool]:
-    """Drop sentences asserting both the subject and a figure."""
-    kept, removed = [], False
-    for sentence in _sentences(answer):
-        if subject.search(sentence) and FIGURE.search(sentence):
-            removed = True
-            continue
-        kept.append(sentence)
+def _normalise_space(value: str) -> str:
+    return " ".join(value.lower().split())
 
-    if not removed:
-        return answer, False
 
-    text = " ".join(s for s in kept if s.strip()).strip()
-    # Stripping can leave a reply that no longer answers anything.
-    if len(text) < 40:
-        text = fallback
-    return text, True
+def _normalise_amount(value: str) -> str:
+    value = value.replace(",", "").replace("–", "-")
+    return re.sub(r"\s*(?:-|to)\s*", "-", value)
+
+
+def _normalise_material(value: str) -> str:
+    value = _normalise_space(value)
+    return {
+        "zinc sulfate": "zinc sulphate",
+        "fertiliser": "fertilizer",
+    }.get(value, value)
+
+
+def _normalise_unit(value: str) -> str:
+    value = value.lower()
+    if value.startswith("k"):
+        return "kg"
+    if value in {"g", "gm"} or value.startswith("gram"):
+        return "g"
+    if value == "l" or value.startswith("lit"):
+        return "l"
+    if value == "ml" or value.startswith("millilit"):
+        return "ml"
+    return "tonne"
+
+
+def _normalise_basis(value: str) -> str:
+    value = value.lower()
+    if value.startswith("acre"):
+        return "acre"
+    if value == "ha" or value.startswith("hectare"):
+        return "ha"
+    return "litre"
+
+
+def _overlaps(span: tuple[int, int], spans: list[tuple[int, int]]) -> bool:
+    return any(span[0] < end and start < span[1] for start, end in spans)
+
+
+def extract_input_claims(text: str) -> set[tuple[str, str, str, str]]:
+    """Return normalized material, amount, unit, and application-basis claims."""
+    claims = set()
+    scoped_spans = []
+    for match in _QUANTITY_WITH_BASIS.finditer(text):
+        material = match.group("before") or match.group("after") or "unspecified"
+        claims.add((
+            _normalise_material(material),
+            _normalise_amount(match.group("amount")),
+            _normalise_unit(match.group("unit")),
+            _normalise_basis(match.group("basis")),
+        ))
+        scoped_spans.append(match.span())
+
+    for pattern in (_MATERIAL_BEFORE_QUANTITY, _MATERIAL_AFTER_QUANTITY):
+        for match in pattern.finditer(text):
+            if _overlaps(match.span(), scoped_spans):
+                continue
+            claims.add((
+                _normalise_material(match.group("material")),
+                _normalise_amount(match.group("amount")),
+                _normalise_unit(match.group("unit")),
+                "missing",
+            ))
+    return claims
+
+
+def extract_waiting_periods(text: str) -> set[int]:
+    """Return pesticide pre-harvest intervals, never ordinary farm intervals."""
+    return {
+        int(match.group("wait") or match.group("interval"))
+        for match in _WAITING_PERIOD.finditer(text)
+    }
+
+
+def extract_financial_figures(text: str) -> set[str]:
+    """Normalize rupee values and percentages for exact evidence comparison."""
+    figures = {
+        f"rupees:{match.group(1).replace(',', '')}"
+        for match in _MONEY_PREFIX.finditer(text)
+    }
+    figures.update(
+        f"rupees:{match.group(1).replace(',', '')}"
+        for match in _MONEY_SUFFIX.finditer(text)
+    )
+    figures.update(f"percent:{match.group(1)}" for match in _PERCENTAGE.finditer(text))
+    return figures
+
+
+def extract_product_recommendations(text: str) -> set[str]:
+    """Return named products recommended by a direct English action verb."""
+    products = set()
+    for match in _PRODUCT_RECOMMENDATION.finditer(text):
+        product = match.group("product").strip()
+        if product and not product[0].isdigit():
+            products.add(_normalise_space(product))
+    return products
+
+
+def _passage_texts(gathered: dict, allowed_tiers: set[str]) -> list[str]:
+    passages = gathered.get("_kb_passages") or []
+    return [
+        passage.get("content", "")
+        for passage in passages
+        if isinstance(passage, dict) and passage.get("tier") in allowed_tiers
+    ]
+
+
+def _is_unmatched_dose_context(doses: str) -> bool:
+    lowered = doses.lstrip().lower()
+    return lowered.startswith("warning:") or lowered.startswith("no registered pesticide use")
+
+
+def _remove(category: str, reason: str) -> None:
+    LOGGER.info("output_guard_removed category=%s reason=%s", category, reason)
 
 
 def scrub(answer: str, gathered: dict) -> tuple[str, bool]:
-    """Remove price and scheme figures that nothing retrieved supports.
-
-    Returns the answer and whether anything was removed. Each check is applied
-    only when its own evidence is missing, so a retrieved figure is never
-    stripped: a farmer who asks what PM-KISAN pays, and whose question retrieval
-    actually covered, still gets the amount.
-    """
+    """Remove unsupported actionable sentences while retaining safe advice."""
     if not answer:
         return answer, False
 
-    changed = False
+    fertilizer_claims = set()
+    for passage in _passage_texts(gathered, {"official", "extension"}):
+        fertilizer_claims.update(extract_input_claims(passage))
 
-    # A support price, with none retrieved for this crop.
-    if not gathered.get("msp"):
-        answer, hit = _strip(answer, PRICE_SCHEME, PRICE_FALLBACK)
-        changed = changed or hit
+    official_financial_figures = set()
+    for passage in _passage_texts(gathered, {"official"}):
+        official_financial_figures.update(extract_financial_figures(passage))
 
-    # A subsidy or scheme amount, where retrieval ran and covered nothing. If
-    # retrieval was not consulted at all there is no claim to check against, and
-    # if it returned usable passages the figure may well be theirs.
-    kb = gathered.get("kb") or ""
-    if kb.startswith(KB_UNCOVERED):
-        answer, hit = _strip(answer, WELFARE_SCHEME, SCHEME_FALLBACK)
-        changed = changed or hit
+    doses = gathered.get("doses") or ""
+    if _is_unmatched_dose_context(doses):
+        pesticide_claims, waiting_periods = set(), set()
+    else:
+        pesticide_claims = extract_input_claims(doses)
+        waiting_periods = extract_waiting_periods(doses)
 
-    return answer, changed
+    registered_products = {
+        _normalise_space(record["product"])
+        for record in (gathered.get("_dose_records") or [])
+        if isinstance(record, dict) and record.get("product")
+    }
+    msp_figures = extract_financial_figures(gathered.get("msp") or "")
+
+    kept, changed = [], False
+    for sentence in _sentences(answer):
+        if not sentence.strip():
+            continue
+        claims = extract_input_claims(sentence)
+        products = extract_product_recommendations(sentence)
+        periods = extract_waiting_periods(sentence)
+        category = reason = None
+
+        if FERTILIZER_SUBJECT.search(sentence) and not claims.issubset(fertilizer_claims):
+            category, reason = "fertilizer", "unsupported_quantity"
+        elif PESTICIDE_SUBJECT.search(sentence):
+            if not claims.issubset(pesticide_claims):
+                category, reason = "pesticide", "unsupported_quantity"
+            elif products and not products.issubset(registered_products):
+                category, reason = "pesticide", "unsupported_product"
+        if category is None and periods and not periods.issubset(waiting_periods):
+            category, reason = "pesticide", "unsupported_waiting_period"
+        if category is None and PRICE_SCHEME.search(sentence):
+            figures = extract_financial_figures(sentence)
+            if figures and not figures.issubset(msp_figures):
+                category, reason = "msp", "unsupported_figure"
+        if category is None and WELFARE_SCHEME.search(sentence):
+            figures = extract_financial_figures(sentence)
+            if figures and not figures.issubset(official_financial_figures):
+                category, reason = "scheme", "unsupported_figure"
+
+        if category is not None:
+            _remove(category, reason)
+            changed = True
+            continue
+        kept.append(sentence.strip())
+
+    if not changed:
+        return answer, False
+
+    cleaned = " ".join(kept).strip()
+    return (cleaned or ACTION_FALLBACK), True
