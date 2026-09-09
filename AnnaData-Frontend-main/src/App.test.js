@@ -1,8 +1,13 @@
 import { render, screen } from '@testing-library/react';
 import App from './App';
+import ContextProvider from './Context/ContextProvider';
 
-test('renders learn react link', () => {
-  render(<App />);
-  const linkElement = screen.getByText(/learn react/i);
-  expect(linkElement).toBeInTheDocument();
+test('renders the AnnaData assistant', () => {
+  render(
+    <ContextProvider>
+      <App />
+    </ContextProvider>
+  );
+
+  expect(screen.getByRole('heading', { name: /annadata/i })).toBeInTheDocument();
 });
