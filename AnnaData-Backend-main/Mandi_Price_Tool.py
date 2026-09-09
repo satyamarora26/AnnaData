@@ -30,6 +30,12 @@ PAGE_SIZE = 100
 _consecutive_failures = 0
 _circuit_opened_at = 0.0
 _breaker_lock = threading.Lock()
+_last_error: str | None = None
+
+
+def last_error() -> str | None:
+    """Return the last recorded request error without contacting data.gov.in."""
+    return _last_error
 
 
 def _circuit_open() -> bool:
@@ -119,7 +125,6 @@ def is_available() -> bool:
         return True                       # no record either way; assume usable
     try:
         with db.connection() as conn:
-            conn.execute(HEALTH_SCHEMA)
             row = conn.execute(
                 "SELECT last_failure, consecutive_failures FROM mandi_health WHERE id = TRUE"
             ).fetchone()
@@ -294,6 +299,7 @@ def get_state_data(state: str, commodity: str | None = None) -> str:
     if _circuit_open():
         return _cache_lookup(state, commodity) or             "Mandi price data unavailable (the government price service is down)."
 
+    global _last_error
     try:
         records = _fetch(state, commodity)
 
@@ -303,6 +309,7 @@ def get_state_data(state: str, commodity: str | None = None) -> str:
 
         _record_success()
         _record_outcome(True)
+        _last_error = None
         summary = format_state_data(records)
         if records:
             _cache_store(state, commodity, summary)
@@ -311,5 +318,6 @@ def get_state_data(state: str, commodity: str | None = None) -> str:
     except Exception as e:
         _record_failure()
         _record_outcome(False)
-        print(f"Mandi price lookup failed for state={state!r}: {e}")
+        _last_error = f"{type(e).__name__}: data.gov.in request failed"
+        print(f"Mandi price lookup failed for state={state!r}: {type(e).__name__}")
         return _cache_lookup(state, commodity) or             "Mandi price data unavailable (lookup failed)."

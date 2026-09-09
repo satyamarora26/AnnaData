@@ -30,7 +30,7 @@ LOCATION_API_KEY = _get("LOCATION_API_KEY")      # Google Maps Geocoding (option
 NOMINATIM_URL = _get("NOMINATIM_URL", "https://nominatim.openstreetmap.org/search")
 NOMINATIM_USER_AGENT = _get(
     "NOMINATIM_USER_AGENT",
-    "AnnaData/1.0 (agricultural advisory for Indian farmers; +https://github.com/vibhuu22/AnnaData)",
+    "AnnaData/1.0 (agricultural advisory for Indian farmers; +https://github.com/satyamarora26/AnnaData)",
 )
 # Restricts results to India so a district name cannot resolve abroad.
 GEOCODE_COUNTRY = _get("GEOCODE_COUNTRY", "in")
@@ -144,44 +144,5 @@ WEATHER_CACHE_PRECISION = int(_get("WEATHER_CACHE_PRECISION", "1"))  # ~11 km
 # a User-Agent naming the application with a way to make contact.
 METNO_USER_AGENT = _get(
     "METNO_USER_AGENT",
-    "AnnaData/1.0 agricultural advisory (+https://github.com/vibhuu22/AnnaData)",
+    "AnnaData/1.0 agricultural advisory (+https://github.com/satyamarora26/AnnaData)",
 )
-
-
-def _documents_loaded() -> bool:
-    try:
-        import knowledge
-        return knowledge.documents_loaded()
-    except Exception:
-        return False
-
-
-def _mandi_reachable() -> bool:
-    """Whether market prices actually work, not merely whether a key is set.
-
-    /health reported mandi_prices true throughout a multi-day upstream outage,
-    because it was answering a question about configuration. A health check that
-    describes intent rather than reality is worse than none.
-    """
-    try:
-        import Mandi_Price_Tool
-        return Mandi_Price_Tool.is_available()
-    except Exception:
-        return bool(GOV_API_KEY)
-
-
-def feature_status() -> dict:
-    """Which integrations are configured. Surfaced on /health."""
-    return {
-        "gemini": bool(GEMINI_API_KEY),
-        # Geocoding always works now: Nominatim needs no key.
-        "geocoding": True,
-        "geocoding_provider": "google" if LOCATION_API_KEY else "nominatim",
-        "mandi_prices": _mandi_reachable(),
-        "soil": bool(EE_SERVICE_KEY),
-        # Retrieval is served from the local vector store; Bedrock is optional.
-        "knowledge_base": _documents_loaded() or bool(
-            KNOWLEDGE_BASE_ID and AWS_ACCESS_KEY and AWS_SECRET_KEY
-        ),
-        "farmer_profiles": bool(DATABASE_URL),
-    }

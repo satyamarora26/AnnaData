@@ -10,10 +10,11 @@ from pydantic import BaseModel
 import config
 import db
 import feedback
+import knowledge
 import msp
 import profile_store
+import readiness
 import startup
-import weather_tool
 from Agent import run_agent
 from process_media import process_media
 
@@ -47,12 +48,20 @@ app.add_middleware(
 @app.on_event("startup")
 def on_startup():
     """Warm up optional subsystems without letting a failure block the service."""
-    startup.init_earth_engine()
-    db.init()
-    feedback.init()
-    msp.init()
+    initializers = (
+        ("database", db.init),
+        ("feedback", feedback.init),
+        ("msp", msp.init),
+        ("knowledge", knowledge.init),
+        ("earth_engine", startup.init_earth_engine),
+    )
+    for name, initialize in initializers:
+        try:
+            initialize()
+        except Exception as exc:
+            print(f"{name} initialization failed: {exc}")
     print(f"CORS origins: {_build_origins()}")
-    print(f"Features: {config.feature_status()}")
+    print(f"Readiness: {readiness.snapshot()}")
 
 
 class QueryRequest(BaseModel):
@@ -86,13 +95,17 @@ def root():
 
 @app.api_route("/health", methods=["GET", "HEAD"])
 def health():
-    """Readiness plus which integrations are actually configured."""
+    """Read-only readiness for configured integrations."""
+    state = readiness.snapshot()
+    configured_failures = [
+        name for name, details in state.items()
+        if isinstance(details, dict)
+        and details.get("configured")
+        and details.get("ready") is False
+    ]
     return {
-        "status": "ok",
-        "features": config.feature_status(),
-        "earth_engine": startup.status(),
-        "database": db.status(),
-        "last_weather_error": weather_tool.last_error(),
+        "status": "degraded" if configured_failures else "ok",
+        "integrations": state,
     }
 
 

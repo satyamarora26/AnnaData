@@ -37,6 +37,11 @@ def last_error() -> str | None:
     return _last_error
 
 
+def is_available() -> bool:
+    """Whether the last recorded weather-provider state is usable."""
+    return _last_error is None
+
+
 def _cache_key(lat, lon) -> tuple:
     p = WEATHER_CACHE_PRECISION
     return (round(float(lat), p), round(float(lon), p))

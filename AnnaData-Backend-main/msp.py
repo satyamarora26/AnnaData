@@ -238,7 +238,6 @@ def counts() -> dict:
         return {}
     try:
         with db.connection() as conn:
-            conn.execute(SCHEMA)
             n = conn.execute(
                 "SELECT count(DISTINCT label) FROM commodity_msp"
             ).fetchone()[0]

@@ -63,3 +63,12 @@ client = genai.Client(api_key=GEMINI_API_KEY)
 def get_client():
     """Returns the GenAI client instance."""
     return client
+
+
+def client_status() -> dict:
+    """Return local client state without making a Gemini request."""
+    return {
+        "initialized": client is not None,
+        "text_models": list(TEXT_MODELS),
+        "media_model": MEDIA_MODEL,
+    }
