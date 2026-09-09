@@ -88,10 +88,35 @@ _ABBREVIATION_PERIOD = re.compile(r"\b(?:rs|mr|mrs|ms|dr|prof|sr|jr|no|etc)\.", 
 _PROTECTED_PERIOD = "\u0000"
 
 
+def _is_soft_input_wrap(left: str, right: str) -> bool:
+    if (
+        not left.strip()
+        or not right.strip()
+        or left.rstrip().endswith((".", "!", "?", "।"))
+        or right.lstrip().startswith(("-", "*", "•"))
+    ):
+        return False
+    joined_claims = extract_input_claims(f"{left.rstrip()} {right.lstrip()}")
+    separate_claims = extract_input_claims(left) | extract_input_claims(right)
+    return bool(joined_claims - separate_claims)
+
+
+def _join_soft_input_wraps(text: str) -> str:
+    lines = text.splitlines()
+    joined = []
+    for line in lines:
+        if joined and _is_soft_input_wrap(joined[-1], line):
+            joined[-1] = f"{joined[-1].rstrip()} {line.lstrip()}"
+        else:
+            joined.append(line)
+    return "\n".join(joined)
+
+
 def _sentences(text: str) -> list[str]:
     protected = _ABBREVIATION_PERIOD.sub(
         lambda match: f"{match.group()[:-1]}{_PROTECTED_PERIOD}", text
     )
+    protected = _join_soft_input_wraps(protected)
     return [
         sentence.replace(_PROTECTED_PERIOD, ".").strip()
         for sentence in re.split(r"\r?\n+|(?<=[.!?।])\s+", protected)

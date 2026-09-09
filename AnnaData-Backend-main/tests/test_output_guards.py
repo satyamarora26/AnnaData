@@ -153,6 +153,19 @@ def test_newline_separates_unsafe_quantity_from_practical_advice():
     assert "evenly moist" in cleaned
 
 
+def test_soft_wrapped_quantity_is_removed_before_sentence_splitting():
+    answer = "Apply 75 kg\nDAP per acre\nKeep the field evenly moist."
+    gathered = {
+        "_guard_context": {"state": "Punjab", "crop": "wheat"},
+        "_kb_passages": [_extension("Apply 55 kg DAP per acre.")],
+    }
+    cleaned, changed = output_guards.scrub(answer, gathered)
+    assert changed
+    assert "75 kg" not in cleaned
+    assert "DAP per acre" not in cleaned
+    assert "evenly moist" in cleaned
+
+
 def test_reference_passage_cannot_authorize_legal_quantity():
     answer = "The legal limit is 5 kg per acre. Keep records of applications."
     gathered = {"_kb_passages": [{"tier": "reference", "content": "The legal limit is 5 kg per acre."}]}
