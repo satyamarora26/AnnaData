@@ -615,7 +615,7 @@ def rank_passages(passages: list[dict], state: str | None, crop: str | None,
 def _bounded_int(value, *, default: int, minimum: int, maximum: int) -> int:
     try:
         value = int(value)
-    except (TypeError, ValueError):
+    except (TypeError, ValueError, OverflowError):
         value = default
     return max(minimum, min(value, maximum))
 
@@ -656,7 +656,10 @@ def _clean_citation_url(value) -> str | None:
     if not isinstance(value, str):
         return None
     url = "".join(value.split()).replace("|", "%7C").replace("[", "%5B").replace("]", "%5D")
-    parsed = urlsplit(url)
+    try:
+        parsed = urlsplit(url)
+    except ValueError:
+        return None
     if parsed.scheme.casefold() != "https" or not parsed.netloc:
         return None
     return url
@@ -703,17 +706,23 @@ def search(query: str, state: str | None = None, crop: str | None = None,
                   FROM documents
                  WHERE active = TRUE AND embedding IS NOT NULL
                    AND (%s::text IS NULL OR %s = ANY(topics))
-              ORDER BY embedding <=> %s::vector
+              ORDER BY embedding <=> %s::vector,
+                          source ASC, authority ASC NULLS LAST, title ASC NULLS LAST,
+                          url ASC NULLS LAST, content ASC, id ASC
                  LIMIT %s
                 """,
                 (str(vector), topic, topic, str(vector), candidate_limit),
             ).fetchall()
-        passages = [
-            {"content": content, "source": source, "title": title, "url": url,
-             "authority": authority, "tier": tier, "scope": _scope_dict(scope),
-             "topics": topics, "similarity": similarity}
-            for content, source, title, url, authority, tier, scope, topics, similarity in rows
-        ]
+        passages = []
+        for content, source, title, url, authority, tier, scope, topics, similarity in rows:
+            decoded_scope = _scope_dict(scope)
+            if decoded_scope is None:
+                continue
+            passages.append({
+                "content": content, "source": source, "title": title, "url": url,
+                "authority": authority, "tier": tier, "scope": decoded_scope,
+                "topics": topics, "similarity": similarity,
+            })
         return rank_passages(passages, state, crop, limit=limit)
     except Exception as e:
         print(f"Knowledge search failed: {e}")

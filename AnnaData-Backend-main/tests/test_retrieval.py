@@ -199,6 +199,50 @@ def test_search_with_none_topic_binds_typed_null_and_defensive_candidate_limit(m
     assert params[-1] == 20
 
 
+def test_search_skips_invalid_scope_rows_without_reclassifying_them_as_unscoped(monkeypatch):
+    rows = [
+        _search_row(source="invalid-scope", scope="{not json}"),
+        _search_row(source="valid-unscoped", scope=None),
+    ]
+    _configure_search(monkeypatch, rows)
+
+    results = knowledge.search("wheat nutrition")
+
+    assert [row["source"] for row in results] == ["valid-unscoped"]
+
+
+def test_search_orders_candidates_deterministically_before_limit(monkeypatch):
+    rows = [
+        _search_row(source="z-source", authority="Z authority", title="Z title"),
+        _search_row(source="a-source", authority="A authority", title="A title"),
+    ]
+    calls = _configure_search(monkeypatch, rows)
+
+    results = knowledge.search("wheat nutrition", candidate_limit=2)
+
+    assert [row["source"] for row in results] == ["a-source", "z-source"]
+    query, params = calls[0]
+    assert "ORDER BY embedding <=> %s::vector,\n                          source ASC, authority ASC NULLS LAST, title ASC NULLS LAST,\n                          url ASC NULLS LAST, content ASC, id ASC" in query
+    assert params == ("[0.1, 0.2]", None, None, "[0.1, 0.2]", 2)
+
+
+def test_numeric_bounds_handle_overflow_without_raising(monkeypatch):
+    rows = [_passage(f"source-{index}", "official", 0.9 - index / 100)
+            for index in range(8)]
+    assert len(knowledge.rank_passages(rows, None, None, limit=float("inf"), min_similarity=0.7)) == 5
+
+    calls = _configure_search(monkeypatch, [_search_row()])
+    assert knowledge.search("wheat nutrition", candidate_limit=float("inf"))
+    assert calls[0][1][-1] == 20
+
+
+def test_malformed_https_url_is_rejected_without_raising():
+    row = _passage("broken-url", "official", 0.9)
+    row["url"] = "https://example\uff1a443"
+
+    assert knowledge.rank_passages([row], None, None, min_similarity=0.7) == []
+
+
 def test_gather_calls_approved_uses_once_and_keeps_matching_raw_records(monkeypatch):
     calls = []
     raw_uses = [{"product": "Approved product", "crop": "rice", "pest": "blast"}]
@@ -332,8 +376,32 @@ def test_active_scheme_names_drive_capabilities(monkeypatch):
     assert all("active = TRUE" in query for query in queries)
 
 
-def _search_row():
+def _configure_search(monkeypatch, rows):
+    calls = []
+
+    class Cursor:
+        def fetchall(self):
+            return rows
+
+    class Connection:
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *_):
+            return False
+
+        def execute(self, query, params):
+            calls.append((query, params))
+            return Cursor()
+
+    monkeypatch.setattr(knowledge.db, "is_available", lambda: True)
+    monkeypatch.setattr(knowledge.db, "connection", Connection)
+    monkeypatch.setattr(knowledge, "embed", lambda _: [0.1, 0.2])
+    return calls
+
+
+def _search_row(source="search-source", authority="Search authority", title="Search title", scope="{}"):
     return (
-        "retrieved evidence", "search-source", "Search title", "https://example.gov.in/search",
-        "Search authority", "official", "{}", ["fertiliser_nutrition"], 0.9,
+        "retrieved evidence", source, title, "https://example.gov.in/search",
+        authority, "official", scope, ["fertiliser_nutrition"], 0.9,
     )
