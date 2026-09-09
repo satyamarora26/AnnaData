@@ -1,170 +1,136 @@
-"""
-Ingest reference documents into the pgvector store.
-
-Handles PDFs and plain HTML. Text is split on paragraph boundaries into chunks
-of roughly CHUNK_CHARS with a little overlap, so a passage that answers a
-question is not cut in half between two chunks and lost to both.
-
-    python tools/ingest_docs.py --pdf data/schemes/pm-kisan.pdf --source "PM-KISAN operational guidelines" --url https://...
-    python tools/ingest_docs.py --dir data/schemes
-    python tools/ingest_docs.py --dry-run --pdf ...
-
-Note on sources: most Indian government agricultural portals cannot be fetched
-programmatically - they are JavaScript-rendered, refuse cloud clients, or link
-to documents that have moved. Where a document will not download, save it from
-a browser into data/schemes and ingest the file.
-"""
+"""Ingest only sources declared in the trusted source manifest."""
 import argparse
-import re
-import sys
 from pathlib import Path
+import sys
+
+import requests
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 import db  # noqa: E402
+import ingestion  # noqa: E402
 import knowledge  # noqa: E402
-
-CHUNK_CHARS = 1000
-OVERLAP_CHARS = 150
-MIN_CHUNK_CHARS = 120
+from source_catalog import SourceSpec, assert_trusted_url, load_catalog  # noqa: E402
 
 
-def read_pdf(path: Path) -> str:
-    import pypdf
-
-    reader = pypdf.PdfReader(str(path))
-    pages = []
-    for page in reader.pages:
-        try:
-            pages.append(page.extract_text() or "")
-        except Exception:
-            continue
-    return "\n\n".join(pages)
+USER_AGENT = "AnnaData/1.0 (+https://github.com/satyamarora26/AnnaData)"
+GENERIC_CONTENT_TYPES = {"", "application/octet-stream"}
 
 
-def read_html(path_or_text: str) -> str:
-    text = re.sub(r"<script.*?</script>|<style.*?</style>", " ",
-                  path_or_text, flags=re.S | re.I)
-    text = re.sub(r"<br\s*/?>|</p>|</div>|</li>", "\n", text, flags=re.I)
-    text = re.sub(r"<[^>]+>", " ", text)
-    return text
+def _content_type_is_allowed(spec: SourceSpec, content_type: str) -> bool:
+    media_type = content_type.split(";", 1)[0].strip().casefold()
+    if media_type in GENERIC_CONTENT_TYPES:
+        return True
+    if spec.local_path.suffix.casefold() == ".pdf":
+        return media_type == "application/pdf"
+    return media_type in {"text/html", "text/plain"}
 
 
-def clean(text: str) -> str:
-    """Tidy extracted text without destroying paragraph structure."""
-    # PDF extraction emits NUL and other control bytes, which Postgres rejects
-    # outright - four chunks of a nine-page factsheet were silently lost to
-    # them before this line existed.
-    text = text.replace("\x00", "")
-    text = re.sub(r"[\x01-\x08\x0b\x0c\x0e-\x1f]", "", text)
-    text = text.replace("\r", "\n")
-    text = re.sub(r"[ \t]+", " ", text)
-    # Page numbers and rules left behind by extraction.
-    text = re.sub(r"^\s*\d+\s*$", "", text, flags=re.MULTILINE)
-    text = re.sub(r"^[-_=]{3,}$", "", text, flags=re.MULTILINE)
-    text = re.sub(r"\n{3,}", "\n\n", text)
-    return text.strip()
+def _record_fetch_failure(spec: SourceSpec, error: Exception) -> None:
+    try:
+        knowledge.record_ingestion_failure("fetch", spec.id, spec.source_url, str(error))
+    except Exception as audit_error:
+        print(f"Could not record fetch failure for {spec.id}: {audit_error}", file=sys.stderr)
 
 
-def chunk(text: str) -> list[str]:
-    """Split into overlapping chunks on paragraph boundaries.
+def fetch_source(spec: SourceSpec) -> bool:
+    """Fetch one HTTP source without replacing a valid local file prematurely."""
+    if spec.fetch_mode == "browser":
+        print(f"browser download required: {spec.source_url} -> {spec.local_path}")
+        return False
 
-    Splitting mid-sentence loses the passage to both neighbours; the overlap
-    means a fact sitting on a boundary still appears whole in one of them.
-    """
-    paragraphs = [p.strip() for p in text.split("\n\n") if p.strip()]
-    chunks, current = [], ""
+    path = spec.local_path
+    part = path.with_suffix(path.suffix + ".part")
+    try:
+        assert_trusted_url(spec.source_url)
+        response = requests.get(
+            spec.source_url,
+            headers={"User-Agent": USER_AGENT},
+            timeout=(10, 120),
+            stream=True,
+        )
+        response.raise_for_status()
+        if not _content_type_is_allowed(spec, response.headers.get("Content-Type", "")):
+            raise ValueError("response content type does not match source extension")
 
-    for para in paragraphs:
-        if len(current) + len(para) + 2 <= CHUNK_CHARS:
-            current = f"{current}\n\n{para}" if current else para
-            continue
-
-        if current:
-            chunks.append(current)
-            tail = current[-OVERLAP_CHARS:]
-            # Resume from a sentence boundary inside the overlap where possible.
-            cut = tail.find(". ")
-            current = (tail[cut + 2:] if cut != -1 else tail) + "\n\n" + para
-        else:
-            current = para
-
-        # A single paragraph longer than the budget is split on sentences.
-        while len(current) > CHUNK_CHARS:
-            window = current[:CHUNK_CHARS]
-            cut = max(window.rfind(". "), window.rfind("।"))
-            if cut < MIN_CHUNK_CHARS:
-                cut = CHUNK_CHARS
-            chunks.append(current[:cut + 1].strip())
-            current = current[cut + 1:].lstrip()
-
-    if len(current.strip()) >= MIN_CHUNK_CHARS:
-        chunks.append(current.strip())
-
-    return [c for c in chunks if len(c) >= MIN_CHUNK_CHARS]
+        path.parent.mkdir(parents=True, exist_ok=True)
+        written = 0
+        with part.open("wb") as handle:
+            for block in response.iter_content(chunk_size=1024 * 1024):
+                if not block:
+                    continue
+                written += len(block)
+                if written > ingestion.MAX_SOURCE_BYTES:
+                    raise ValueError(f"download exceeds {ingestion.MAX_SOURCE_BYTES} bytes")
+                handle.write(block)
+        ingestion.validate_source_file(part)
+        part.replace(path)
+        print(f"fetched {spec.id}: {path}")
+        return True
+    except Exception as exc:
+        part.unlink(missing_ok=True)
+        _record_fetch_failure(spec, exc)
+        print(f"fetch failed for {spec.id}: {exc}", file=sys.stderr)
+        return False
 
 
-def ingest(path: Path, source: str, url: str | None, dry: bool,
-           tier: str = "reference") -> int:
-    raw = read_pdf(path) if path.suffix.lower() == ".pdf" else \
-        read_html(path.read_text(encoding="utf-8", errors="replace"))
-    text = clean(raw)
-    chunks = chunk(text)
-
-    print(f"  {path.name}: {len(text):,} chars -> {len(chunks)} chunks")
-    if dry:
-        for c in chunks[:2]:
-            print(f"    sample: {c[:180]}...")
-        return len(chunks)
-
-    stored = 0
-    for i, c in enumerate(chunks):
-        if knowledge.add_document(source=source, content=c, title=path.stem,
-                                  url=url, chunk_index=i, tier=tier):
-            stored += 1
-        if stored and stored % 25 == 0:
-            print(f"    stored {stored}/{len(chunks)}")
-    print(f"    stored {stored}/{len(chunks)}")
-    return stored
+def _parse_args() -> argparse.Namespace:
+    parser = argparse.ArgumentParser(description=__doc__)
+    selection = parser.add_mutually_exclusive_group(required=True)
+    selection.add_argument("--source-id", help="one manifest entry")
+    selection.add_argument("--all", action="store_true", help="every manifest entry")
+    parser.add_argument("--fetch", action="store_true", help="download entries whose fetch mode is http")
+    parser.add_argument("--dry-run", action="store_true", help="parse and report without database writes")
+    parser.add_argument("--manifest", type=Path, default=Path("data/source_manifest.json"), help="source manifest path")
+    return parser.parse_args()
 
 
 def main() -> int:
-    ap = argparse.ArgumentParser()
-    ap.add_argument("--pdf", help="a single file to ingest")
-    ap.add_argument("--dir", help="a folder of files to ingest")
-    ap.add_argument("--source", help="human-readable source name")
-    ap.add_argument("--url", help="where the document came from")
-    ap.add_argument("--tier", choices=["official", "reference"], default="reference",
-                    help="official for government documents, reference otherwise")
-    ap.add_argument("--dry-run", action="store_true")
-    args = ap.parse_args()
+    args = _parse_args()
+    catalog = load_catalog(args.manifest)
+    if args.all:
+        specs = list(catalog.values())
+    else:
+        spec = catalog.get(args.source_id)
+        if spec is None:
+            print(f"unknown source id: {args.source_id}", file=sys.stderr)
+            return 2
+        specs = [spec]
 
-    if not args.pdf and not args.dir:
-        ap.error("give --pdf or --dir")
+    available: list[SourceSpec] = []
+    for spec in specs:
+        if args.fetch and not fetch_source(spec):
+            continue
+        available.append(spec)
+
+    if not available:
+        return 1
 
     if not args.dry_run:
         db.init()
         if not db.is_available():
-            print("No database. Set DATABASE_URL.")
+            print("No database. Set DATABASE_URL.", file=sys.stderr)
             return 1
         knowledge.init()
 
-    files = [Path(args.pdf)] if args.pdf else sorted(Path(args.dir).glob("*.*"))
-    files = [f for f in files if f.suffix.lower() in (".pdf", ".html", ".htm", ".txt")]
-    if not files:
-        print("Nothing to ingest.")
-        return 1
+    status = 0
+    for spec in available:
+        try:
+            result = ingestion.ingest_source(spec, spec.local_path, args.dry_run)
+        except Exception as exc:
+            print(f"ingestion failed for {spec.id}: {exc}", file=sys.stderr)
+            status = 1
+            continue
+        print(
+            f"{result.source_id}: {result.status}; parsed={result.parsed} "
+            f"stored={result.stored} rejected={result.rejected}"
+        )
+        if result.status == "failed":
+            status = 1
 
-    total = 0
-    for f in files:
-        source = args.source or f.stem.replace("-", " ").replace("_", " ").title()
-        total += ingest(f, source, args.url, args.dry_run, args.tier)
-
-    print(f"\n{total} chunks {'parsed' if args.dry_run else 'stored'}")
     if not args.dry_run:
-        print("knowledge store:", knowledge.counts())
         db.close()
-    return 0
+    return status
 
 
 if __name__ == "__main__":
