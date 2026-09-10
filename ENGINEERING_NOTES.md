@@ -964,6 +964,36 @@ managed attempt. The final live snapshot was unchanged: 46 active chunks,
 including PM-KISAN 38 and Soil Health Card 8. No large source completed, so no
 idempotence rerun is claimed.
 
+### Task 8 fix round 3 (2026-09-10)
+
+Activation now treats the aggregate deadline as a transaction boundary, not
+only a pre-activation check. Each activation statement is issued with its
+remaining `statement_timeout`; PostgreSQL servers that report
+`current_setting('transaction_timeout', true)` also receive that remaining
+whole-transaction timeout. A clock expiry observed during activation raises
+inside the transaction, so the replacement rows and active-state changes roll
+back before the completed audit can commit. The tests retain the distinct
+pre-audit case: an already-expired activation does not mutate an audit it has
+not safely inspected; the caller records that run as failed.
+
+Gemini batch embedding remains ordered and validates response count and the
+768-dimensional vectors. It now accepts at most one HTTP 429 retry, only where
+the numeric `Retry-After` is positive and strictly fits the original remaining
+request budget. It logs neither request content nor provider key. The focused
+command `./.venv/bin/python -m pytest tests/test_knowledge_ingestion.py
+tests/test_ingestion.py tests/test_output_guards.py -q` reported **67 passed in
+0.10s**; `./.venv/bin/python -m pytest -q` reported **116 passed in 0.94s**.
+
+One new managed, 120-second live attempt was made for each retained large
+source. All produced a final Gemini HTTP 429 failure: PMFBY `805/20/785`, NHB
+`971/0/971`, PAU Kharif `683/0/683`, and PAU Rabi `596/0/596`
+(parsed/stored/rejected). No run completed, so an idempotence rerun would not
+be evidence and was not made. The bounded direct live audit returned 46 active
+documents, PM-KISAN 38, and Soil Health Card 8; its latest four runs were all
+failed. The current browser controller evidence is likewise not a pass: backend
+and frontend rendered on 8013/3013, but native CUA `setValue`/`fill` followed
+by click/Return did not change the form or emit a backend request.
+
 ### Open-Meteo rate limits by IP, and the IP is shared
 
 Weather worked locally in 2s and failed in production. The cause was

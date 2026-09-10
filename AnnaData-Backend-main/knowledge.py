@@ -20,6 +20,8 @@ no infrastructure and no cost.
 import json
 import math
 import re
+import time
+import urllib.error
 import urllib.request
 from dataclasses import asdict
 from urllib.parse import urlsplit
@@ -144,7 +146,8 @@ def embed(text: str, dim: int = EMBED_DIM, timeout_seconds: float = 60) -> list[
 
 
 def embed_batch(
-    texts: list[str], dim: int = EMBED_DIM, timeout_seconds: float = 60
+    texts: list[str], dim: int = EMBED_DIM, timeout_seconds: float = 60,
+    sleep=time.sleep,
 ) -> list[list[float]] | None:
     """Embed an ordered batch through Gemini's documented batch endpoint."""
     if not GEMINI_API_KEY or not texts or timeout_seconds <= 0:
@@ -159,23 +162,40 @@ def embed_batch(
     ]
     body = json.dumps({"requests": requests}).encode()
     url = f"https://generativelanguage.googleapis.com/v1beta/models/{EMBED_MODEL}:batchEmbedContents"
-    try:
-        req = urllib.request.Request(
-            url,
-            data=body,
-            headers={"Content-Type": "application/json", "x-goog-api-key": GEMINI_API_KEY},
-        )
-        with urllib.request.urlopen(req, timeout=timeout_seconds) as response:
-            embeddings = json.load(response).get("embeddings")
-        if not isinstance(embeddings, list) or len(embeddings) != len(texts):
-            raise ValueError("batch embedding response count did not match request count")
-        values = [item.get("values") if isinstance(item, dict) else None for item in embeddings]
-        if any(not isinstance(vector, list) or len(vector) != dim for vector in values):
-            raise ValueError("batch embedding response had an unexpected dimension")
-        return values
-    except Exception as exc:
-        print(f"Batch embedding failed: {exc}")
-        return None
+    started_at = time.monotonic()
+    for attempt in range(2):
+        remaining = timeout_seconds - (time.monotonic() - started_at)
+        if remaining <= 0:
+            print("Batch embedding failed: ingestion deadline exceeded")
+            return None
+        try:
+            req = urllib.request.Request(
+                url,
+                data=body,
+                headers={"Content-Type": "application/json", "x-goog-api-key": GEMINI_API_KEY},
+            )
+            with urllib.request.urlopen(req, timeout=remaining) as response:
+                embeddings = json.load(response).get("embeddings")
+            if not isinstance(embeddings, list) or len(embeddings) != len(texts):
+                raise ValueError("batch embedding response count did not match request count")
+            values = [item.get("values") if isinstance(item, dict) else None for item in embeddings]
+            if any(not isinstance(vector, list) or len(vector) != dim for vector in values):
+                raise ValueError("batch embedding response had an unexpected dimension")
+            return values
+        except urllib.error.HTTPError as exc:
+            retry_after = exc.headers.get("Retry-After") if exc.headers else None
+            try:
+                delay = float(retry_after) if retry_after is not None else 0
+            except ValueError:
+                delay = 0
+            if exc.code != 429 or attempt or delay <= 0 or delay >= remaining:
+                print(f"Batch embedding failed: HTTP Error {exc.code}: {exc.reason}")
+                return None
+            sleep(delay)
+        except Exception as exc:
+            print(f"Batch embedding failed: {exc}")
+            return None
+    return None
 
 
 # The register writes a crop one way; farmers write it several others. These
@@ -465,16 +485,46 @@ def stage_document(run_id: int, spec: SourceSpec, content_hash: str,
 
 
 def activate_documents(run_id: int, spec: SourceSpec, content_hash: str,
-                       parsed: int, stored: int, rejected: int) -> bool:
+                       parsed: int, stored: int, rejected: int,
+                       deadline_at: float | None = None,
+                       timeout_seconds: float | None = None,
+                       clock=time.monotonic) -> bool:
     """Atomically replace a source only when every parsed chunk was staged."""
     running_run = False
     try:
         with db.connection() as conn:
-            conn.execute(
+            if deadline_at is None and timeout_seconds is not None:
+                deadline_at = clock() + timeout_seconds
+
+            def execute(sql: str, params=()):
+                if deadline_at is not None:
+                    remaining = deadline_at - clock()
+                    if remaining <= 0:
+                        raise TimeoutError("ingestion deadline exceeded during activation")
+                    conn.execute(
+                        "SET LOCAL statement_timeout = %s",
+                        (max(1, int(remaining * 1000)),),
+                    )
+                return conn.execute(sql, params)
+
+            if deadline_at is not None:
+                supports_transaction_timeout = execute(
+                    "SELECT current_setting('transaction_timeout', true)"
+                ).fetchone()
+                if supports_transaction_timeout and supports_transaction_timeout[0] is not None:
+                    remaining = deadline_at - clock()
+                    if remaining <= 0:
+                        raise TimeoutError("ingestion deadline exceeded during activation")
+                    conn.execute(
+                        "SET LOCAL transaction_timeout = %s",
+                        (max(1, int(remaining * 1000)),),
+                    )
+
+            execute(
                 "SELECT pg_advisory_xact_lock(hashtext(%s))",
                 (spec.id,),
             )
-            audit = conn.execute(
+            audit = execute(
                 """SELECT source, content_hash, status, parsed_count, stored_count,
                           rejected_count
                      FROM ingestion_runs WHERE id = %s FOR UPDATE""",
@@ -490,7 +540,7 @@ def activate_documents(run_id: int, spec: SourceSpec, content_hash: str,
                         or audit_rejected != rejected or parsed <= 0
                         or stored != parsed or rejected):
                     return False
-                active_count, owned_active_count = conn.execute(
+                active_count, owned_active_count = execute(
                     """SELECT count(*) AS active_count,
                               count(*) FILTER (
                                   WHERE ingestion_run_id = %s AND source = %s
@@ -508,7 +558,7 @@ def activate_documents(run_id: int, spec: SourceSpec, content_hash: str,
                 return False
             if parsed <= 0 or stored != parsed or rejected:
                 raise ValueError("replacement corpus was incomplete")
-            staged_count, owned_count = conn.execute(
+            staged_count, owned_count = execute(
                 """SELECT count(*) AS staged_count,
                           count(*) FILTER (
                               WHERE source = %s AND content_hash = %s AND active = FALSE
@@ -519,17 +569,17 @@ def activate_documents(run_id: int, spec: SourceSpec, content_hash: str,
             ).fetchone()
             if staged_count != parsed or owned_count != parsed:
                 raise ValueError("staged document ownership/count mismatch")
-            conn.execute(
+            execute(
                 "UPDATE documents SET active = FALSE WHERE source = %s AND active = TRUE",
                 (spec.id,),
             )
-            conn.execute(
+            execute(
                 """UPDATE documents SET active = TRUE
                      WHERE ingestion_run_id = %s AND source = %s
                        AND content_hash = %s AND active = FALSE""",
                 (run_id, spec.id, content_hash),
             )
-            conn.execute(
+            execute(
                 """DELETE FROM documents AS stale
                      WHERE stale.source = %s AND stale.active = FALSE
                        AND (stale.ingestion_run_id IS NULL OR stale.ingestion_run_id <> %s)
@@ -540,7 +590,7 @@ def activate_documents(run_id: int, spec: SourceSpec, content_hash: str,
                        )""",
                 (spec.id, run_id),
             )
-            conn.execute(
+            execute(
                 """UPDATE ingestion_runs
                       SET status = 'completed', parsed_count = %s, stored_count = %s,
                           rejected_count = %s, completed_at = now()

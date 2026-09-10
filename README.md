@@ -148,12 +148,17 @@ python tools/ingest_docs.py --source-id soil_health_card_faq --deadline-seconds 
 ```
 
 An expired budget fails the active ingestion audit and does not activate staged
-documents, preserving the prior active corpus.
+documents, preserving the prior active corpus. During activation, every SQL
+statement receives only the remaining budget; servers that expose PostgreSQL's
+`transaction_timeout` also bound the whole activation transaction. An expiry
+before completion rolls the transaction back before the replacement can publish.
 
 Document ingestion uses Gemini's official ordered batch embedding endpoint and
-passes its remaining aggregate budget as the request timeout. It still records
-a failed audit and preserves the prior corpus when Gemini rejects a batch or
-the budget expires; a failed source must not be treated as idempotent success.
+passes its remaining aggregate budget as the request timeout. A Gemini HTTP 429
+is retried at most once, only when its `Retry-After` delay fits inside that same
+remaining budget. It still records a failed audit and preserves the prior corpus
+when Gemini rejects a batch or the budget expires; a failed source must not be
+treated as idempotent success.
 
 `GET /health` returns `status` plus an `integrations` object. Each configured
 provider exposes configured versus ready state; `database`, `earth_engine`, and
@@ -188,6 +193,15 @@ Playwright, Puppeteer, Cypress, or browser executable was installed. The four
 large retained documents made one bounded batch attempt each; Gemini returned
 HTTP 429 before any could activate. The live corpus remains 46 active chunks:
 38 PM-KISAN and 8 Soil Health Card.
+
+In fix round 3, the four retained large documents each made one new
+120-second attempt and each returned a final Gemini HTTP 429 CLI failure:
+PMFBY `805/20/785`, NHB `971/0/971`, PAU Kharif `683/0/683`, and PAU Rabi
+`596/0/596` (parsed/stored/rejected). No source completed, so no idempotence
+rerun is claimed. The direct live audit remained 46 active chunks: PM-KISAN 38
+and Soil Health Card 8. Browser E2E is still unverified: supplied controller
+evidence says the current page rendered on 8013/3013, but CUA `setValue`/`fill`
+then click/Return left the form unchanged and emitted no backend request.
 
 ---
 

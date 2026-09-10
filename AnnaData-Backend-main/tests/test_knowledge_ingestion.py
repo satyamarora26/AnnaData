@@ -25,6 +25,7 @@ class RecordingConnection:
         self.staged_counts = (3, 3)
         self.active_counts = (3, 3)
         self.audit_row = ("pm_kisan_guidelines", "abc123", "running", 0, 0, 0)
+        self.transaction_timeout_setting = None
         self.errors = {}
 
     def execute(self, sql, params=()):
@@ -39,6 +40,8 @@ class RecordingConnection:
             return Result((41,))
         if "FROM ingestion_runs WHERE id = %s FOR UPDATE" in compact:
             return Result(self.audit_row)
+        if "current_setting('transaction_timeout', true)" in compact:
+            return Result((self.transaction_timeout_setting,))
         if "AS active_count" in compact:
             return Result(self.active_counts)
         if "AS staged_count" in compact:
@@ -209,6 +212,51 @@ def test_document_activation_deactivates_old_version_before_publishing_new(monke
     publish = statements[publish_index]
     assert "source = %s AND content_hash = %s" in publish
     assert "status = 'completed'" in statements[-1]
+
+
+def test_activation_expiry_before_commit_fails_without_completion(monkeypatch):
+    conn = _recording_connection(monkeypatch)
+
+    assert not knowledge.activate_documents(
+        41, _spec(), "abc123", 3, 3, 0,
+        deadline_at=10, timeout_seconds=0.5, clock=lambda: 10,
+    )
+
+    statements = [sql for sql, _ in conn.calls]
+    assert not any("status = 'failed'" in sql for sql in statements)
+    assert not any("status = 'completed'" in sql for sql in statements)
+
+
+def test_activation_expiry_during_transaction_fails_without_completion(monkeypatch):
+    conn = _recording_connection(monkeypatch)
+    calls = 0
+
+    def clock():
+        nonlocal calls
+        calls += 1
+        return 0 if calls < 4 else 1
+
+    assert not knowledge.activate_documents(
+        41, _spec(), "abc123", 3, 3, 0,
+        deadline_at=1, timeout_seconds=1, clock=clock,
+    )
+
+    statements = [sql for sql, _ in conn.calls]
+    assert any("status = 'failed'" in sql for sql in statements)
+    assert not any("status = 'completed'" in sql for sql in statements)
+
+
+def test_activation_uses_transaction_timeout_when_server_supports_it(monkeypatch):
+    conn = _recording_connection(monkeypatch)
+    conn.transaction_timeout_setting = "0"
+
+    assert knowledge.activate_documents(
+        41, _spec(), "abc123", 3, 3, 0,
+        deadline_at=10, timeout_seconds=1, clock=lambda: 0,
+    )
+
+    statements = [sql for sql, _ in conn.calls]
+    assert any("SET LOCAL transaction_timeout" in sql for sql in statements)
 
 
 def test_partial_stage_is_rejected_without_deactivating_current_corpus(monkeypatch):
@@ -443,4 +491,39 @@ def test_batch_embed_uses_official_endpoint_and_remaining_timeout(monkeypatch):
     assert result == [[0.1, 0.2], [0.3, 0.4]]
     assert captured["url"].endswith("models/gemini-embedding-001:batchEmbedContents")
     assert b'"requests"' in captured["body"]
-    assert captured["timeout"] == 7.5
+    assert 0 < captured["timeout"] <= 7.5
+
+
+def test_batch_embed_retries_one_429_within_its_remaining_budget(monkeypatch):
+    calls = []
+    sleeps = []
+
+    class Response:
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *args):
+            return None
+
+        def read(self):
+            return b'{"embeddings": [{"values": [0.1, 0.2]}]}'
+
+    def urlopen(request, timeout):
+        calls.append(timeout)
+        if len(calls) == 1:
+            raise knowledge.urllib.error.HTTPError(
+                request.full_url, 429, "rate limited", {"Retry-After": "0.25"}, None
+            )
+        return Response()
+
+    monkeypatch.setattr(knowledge, "GEMINI_API_KEY", "test-key")
+    monkeypatch.setattr(knowledge.urllib.request, "urlopen", urlopen)
+    monkeypatch.setattr(knowledge.time, "monotonic", lambda: 0)
+
+    result = knowledge.embed_batch(
+        ["first"], dim=2, timeout_seconds=1, sleep=sleeps.append,
+    )
+
+    assert result == [[0.1, 0.2]]
+    assert calls == [1, 1]
+    assert sleeps == [0.25]
