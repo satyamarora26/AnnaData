@@ -456,7 +456,7 @@ def _registered_use_line(gathered: dict) -> str | None:
 def _matches_dose_record(products: set[str], claims: set, periods: set[int], record: tuple) -> bool:
     product, record_claims, record_periods = record
     return (
-        (not products or products == {product})
+        products == {product}
         and claims.issubset(record_claims)
         and periods.issubset(record_periods)
     )

@@ -16,6 +16,7 @@ OVERLAP_CHARS = 150
 MIN_CHUNK_CHARS = 120
 SUPPORTED_EXTENSIONS = {".pdf", ".html", ".htm", ".txt"}
 EMBED_BATCH_SIZE = 20
+DEFAULT_INGESTION_DEADLINE_SECONDS = 300
 
 
 @dataclass(frozen=True)
@@ -129,13 +130,21 @@ def clean_text(text: str) -> str:
     return text.strip()
 
 
-def chunk_text(text: str) -> list[str]:
+def chunk_text(
+    text: str,
+    *,
+    deadline_at: float | None = None,
+    clock=None,
+) -> list[str]:
     """Split into overlapping chunks on paragraph boundaries."""
+    clock = clock or time.monotonic
+    _check_deadline(deadline_at, clock)
     paragraphs = [paragraph.strip() for paragraph in text.split("\n\n") if paragraph.strip()]
     chunks: list[str] = []
     current = ""
 
     for paragraph in paragraphs:
+        _check_deadline(deadline_at, clock)
         if len(current) + len(paragraph) + 2 <= CHUNK_CHARS:
             current = f"{current}\n\n{paragraph}" if current else paragraph
             continue
@@ -149,6 +158,7 @@ def chunk_text(text: str) -> list[str]:
             current = paragraph
 
         while len(current) > CHUNK_CHARS:
+            _check_deadline(deadline_at, clock)
             window = current[:CHUNK_CHARS]
             cut = max(window.rfind(". "), window.rfind("।"))
             if cut < MIN_CHUNK_CHARS:
@@ -159,6 +169,7 @@ def chunk_text(text: str) -> list[str]:
     if len(current.strip()) >= MIN_CHUNK_CHARS:
         chunks.append(current.strip())
 
+    _check_deadline(deadline_at, clock)
     return [chunk for chunk in chunks if len(chunk) >= MIN_CHUNK_CHARS]
 
 
@@ -166,10 +177,10 @@ def ingest_source(
     spec: SourceSpec,
     path: Path,
     dry_run: bool = False,
-    deadline_seconds: float | None = None,
+    deadline_seconds: float = DEFAULT_INGESTION_DEADLINE_SECONDS,
 ) -> IngestResult:
     started_at = time.monotonic()
-    deadline_at = None if deadline_seconds is None else started_at + deadline_seconds
+    deadline_at = started_at + deadline_seconds
 
     def remaining_seconds() -> float | None:
         if deadline_at is None:
@@ -188,7 +199,7 @@ def ingest_source(
         remaining_seconds()
         validate_extracted_text(spec, cleaned)
         content_hash = sha256_text(cleaned)
-        chunks = chunk_text(cleaned)
+        chunks = chunk_text(cleaned, deadline_at=deadline_at, clock=time.monotonic)
         remaining_seconds()
         if not chunks:
             raise ValueError(f"no usable text extracted from {path}")

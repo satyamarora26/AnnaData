@@ -75,6 +75,31 @@ def test_cleaning_and_chunking_keep_paragraph_overlap():
     assert chunks[0][-100:] in chunks[1]
 
 
+def test_ingestion_default_deadline_is_passed_into_chunking(tmp_path, monkeypatch):
+    path = tmp_path / "guidance.txt"
+    path.write_text(_guidance_text(), encoding="utf-8")
+    observed = {}
+
+    def capture_chunk_deadline(text, *, deadline_at=None, clock=None):
+        observed["deadline_at"] = deadline_at
+        return [text]
+
+    monkeypatch.setattr(ingestion, "chunk_text", capture_chunk_deadline)
+
+    result = ingestion.ingest_source(_spec(), path, dry_run=True)
+
+    assert result.status == "dry-run"
+    assert isinstance(observed["deadline_at"], float)
+
+
+def test_chunking_stops_when_aggregate_deadline_expires():
+    text = ("First verified paragraph. " * 20) + "\n\n" + ("Second verified paragraph. " * 20)
+    ticks = iter([0.0, 0.5, 1.0])
+
+    with pytest.raises(TimeoutError, match="extraction deadline exceeded"):
+        ingestion.chunk_text(text, deadline_at=1.0, clock=lambda: next(ticks))
+
+
 def test_embedding_failure_preserves_active_corpus(tmp_path, monkeypatch):
     path = tmp_path / "guidance.txt"
     path.write_text(_guidance_text(), encoding="utf-8")
@@ -118,7 +143,7 @@ def test_complete_ingestion_activates_all_chunks(tmp_path, monkeypatch):
     monkeypatch.setattr(
         ingestion.knowledge,
         "activate_documents",
-        lambda run_id, spec, digest, parsed, stored, rejected: parsed == stored and rejected == 0,
+        lambda run_id, spec, digest, parsed, stored, rejected, **kwargs: parsed == stored and rejected == 0,
     )
 
     result = ingestion.ingest_source(_spec(), path)
@@ -256,7 +281,7 @@ def test_deadline_before_staging_rolls_back_without_activation(tmp_path, monkeyp
     path.write_text(_guidance_text(), encoding="utf-8")
     failures = []
     now = [0.0]
-    monkeypatch.setattr(ingestion, "chunk_text", lambda text: [text])
+    monkeypatch.setattr(ingestion, "chunk_text", lambda text, **kwargs: [text])
     monkeypatch.setattr(ingestion.time, "monotonic", lambda: now[0])
     monkeypatch.setattr(ingestion.knowledge, "start_ingestion", lambda *args: 21)
     def embed_batch(texts, **kwargs):
@@ -278,7 +303,7 @@ def test_ingestion_renews_lease_before_bounded_embedding(tmp_path, monkeypatch):
     path = tmp_path / "guidance.txt"
     path.write_text(_guidance_text(), encoding="utf-8")
     events = []
-    monkeypatch.setattr(ingestion, "chunk_text", lambda text: [text])
+    monkeypatch.setattr(ingestion, "chunk_text", lambda text, **kwargs: [text])
     monkeypatch.setattr(ingestion.knowledge, "start_ingestion", lambda *args: 23)
     monkeypatch.setattr(
         ingestion.knowledge,
@@ -308,7 +333,7 @@ def test_deadline_before_activation_rolls_back_after_staging(tmp_path, monkeypat
     path.write_text(_guidance_text(), encoding="utf-8")
     failures = []
     now = [0.0]
-    monkeypatch.setattr(ingestion, "chunk_text", lambda text: [text])
+    monkeypatch.setattr(ingestion, "chunk_text", lambda text, **kwargs: [text])
     monkeypatch.setattr(ingestion.time, "monotonic", lambda: now[0])
     monkeypatch.setattr(ingestion.knowledge, "start_ingestion", lambda *args: 22)
     monkeypatch.setattr(ingestion.knowledge, "embed_batch", lambda texts, **kwargs: [[0.0] * 768])
@@ -330,7 +355,7 @@ def test_activation_deadline_failure_is_terminally_recorded(tmp_path, monkeypatc
     path = tmp_path / "guidance.txt"
     path.write_text(_guidance_text(), encoding="utf-8")
     failures = []
-    monkeypatch.setattr(ingestion, "chunk_text", lambda text: [text])
+    monkeypatch.setattr(ingestion, "chunk_text", lambda text, **kwargs: [text])
     monkeypatch.setattr(ingestion.knowledge, "start_ingestion", lambda *args: 23)
     monkeypatch.setattr(
         ingestion.knowledge, "embed_batch", lambda texts, **kwargs: [[0.0] * 768]
@@ -355,7 +380,7 @@ def test_ambiguous_activation_rejection_is_terminally_recorded(tmp_path, monkeyp
     path = tmp_path / "guidance.txt"
     path.write_text(_guidance_text(), encoding="utf-8")
     failures = []
-    monkeypatch.setattr(ingestion, "chunk_text", lambda text: [text])
+    monkeypatch.setattr(ingestion, "chunk_text", lambda text, **kwargs: [text])
     monkeypatch.setattr(ingestion.knowledge, "start_ingestion", lambda *args: 24)
     monkeypatch.setattr(
         ingestion.knowledge, "embed_batch", lambda texts, **kwargs: [[0.0] * 768]

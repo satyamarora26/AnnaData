@@ -272,6 +272,23 @@ def test_intent_and_units_guard_pesticide_named_without_action_verb():
     assert "Remove affected leaves" in cleaned
 
 
+def test_unknown_pesticide_cannot_borrow_matching_dose_from_another_product():
+    answer = "Acephate 500 ml/ha is suitable. Remove affected leaves."
+    gathered = {
+        "_guard_context": {"intent": "disease_pest"},
+        "doses": "Registered pesticide uses: Product B, dose 500 ml/ha.",
+        "_dose_records": [
+            {"product": "Product B", "dose_formulation": "500 ml/ha"},
+        ],
+    }
+
+    cleaned, changed = output_guards.scrub(answer, gathered)
+
+    assert changed
+    assert "Acephate" not in cleaned
+    assert "Remove affected leaves" in cleaned
+
+
 def test_currencyless_scheme_payment_requires_matching_evidence():
     answer = "PM-KISAN pays 6000 each year. Keep your registration details current."
 

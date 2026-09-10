@@ -252,6 +252,28 @@ def test_invalid_weather_response_is_unavailable_not_ready(monkeypatch):
     assert weather_tool.is_available() is False
 
 
+def test_weather_dates_without_measurements_are_not_synthesized_as_zeroes(monkeypatch):
+    _reset_weather_state(monkeypatch)
+
+    class Response:
+        def raise_for_status(self):
+            return None
+
+        def json(self):
+            return {"daily": {"time": [weather_tool.date.today().isoformat()]}}
+
+    monkeypatch.setattr(weather_tool.requests, "get", lambda *args, **kwargs: Response())
+    monkeypatch.setattr(weather_tool.weather_fallback, "fetch", lambda lat, lon: None)
+
+    report = weather_tool.weather_openmeteo(1, 2)
+    state = weather_tool.status()
+
+    assert report == "Weather data unavailable (unexpected response)."
+    assert "0.0-0.0C" not in report
+    assert state["state"] == "unavailable"
+    assert state["last_error"] == "open_meteo_invalid_response"
+
+
 def test_malformed_weather_payload_falls_back_and_finishes_unavailable(monkeypatch):
     _reset_weather_state(monkeypatch)
 

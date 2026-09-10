@@ -209,26 +209,42 @@ def _fetch_weather(lat, lon) -> str:
         return "Weather data unavailable (lookup failed)."
 
     daily = data.get("daily")
-    if not daily or not daily.get("time"):
+    times = daily.get("time") if isinstance(daily, dict) else None
+    required_series = (
+        "temperature_2m_max",
+        "temperature_2m_min",
+        "precipitation_sum",
+        "windspeed_10m_max",
+    )
+    if (
+        not isinstance(times, list)
+        or not times
+        or any(not isinstance(value, str) or not value for value in times)
+        or any(
+            not isinstance(daily.get(key), list)
+            or len(daily[key]) != len(times)
+            or any(
+                isinstance(value, bool) or not isinstance(value, (int, float))
+                for value in daily[key]
+            )
+            for key in required_series
+        )
+    ):
         _set_primary_error("open_meteo_invalid_response")
         return "Weather data unavailable (unexpected response)."
 
-    times = daily["time"]
-
-    def series(key):
-        return daily.get(key) or [None] * len(times)
-
-    tmax, tmin = series("temperature_2m_max"), series("temperature_2m_min")
-    precip, wind = series("precipitation_sum"), series("windspeed_10m_max")
+    tmax = daily["temperature_2m_max"]
+    tmin = daily["temperature_2m_min"]
+    precip = daily["precipitation_sum"]
+    wind = daily["windspeed_10m_max"]
 
     # Locate today by date string; fall back to the last past day available.
     today_str = today.isoformat()
     idx = times.index(today_str) if today_str in times else len(times) - FORECAST_DAYS - 1
     idx = max(0, min(idx, len(times) - 1))
 
-    def num(values, i, default=0.0):
-        v = values[i] if 0 <= i < len(values) else None
-        return default if v is None else v
+    def num(values, i):
+        return values[i]
 
     past_rain = [num(precip, i) for i in range(idx)]
     last_30_sum = sum(past_rain)
