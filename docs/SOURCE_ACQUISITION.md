@@ -18,6 +18,9 @@ document. The ingestion audit is authoritative for active corpus status.
 - PMFBY, NHB, and both PAU package PDFs are present and parse successfully.
   A bounded PMFBY retry timed out after staging 86 of 805 chunks. Its incomplete
   data was not activated. Larger sources require a successful atomic retry.
+  Batch staging subsequently wrote 140 chunks in a later attempt, but Gemini
+  HTTP 429 prevented completion despite provider-directed backoff. The active
+  corpus remained unchanged; see `VERIFICATION_STATUS.md`.
 
 Downloaded documents remain ignored by Git. The manifest preserves authority,
 scope and source URL; ingestion records hashes and terminal results. Acquisition

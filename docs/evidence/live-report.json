@@ -1,5 +1,5 @@
 {
-  "timestamp": "2026-09-10T11:33:06.523Z",
+  "timestamp": "2026-09-10T11:48:56.186Z",
   "results": [
     {
       "viewport": {
@@ -8,7 +8,7 @@
       },
       "mode": "live provider",
       "answerReceived": true,
-      "elapsedMs": 7953
+      "elapsedMs": 12569
     },
     {
       "viewport": {
@@ -17,7 +17,7 @@
       },
       "mode": "live provider",
       "answerReceived": true,
-      "elapsedMs": 10410
+      "elapsedMs": 13276
     }
   ]
 }

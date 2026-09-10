@@ -29,6 +29,6 @@ adoption, field accuracy, production SLA, or measured percentage improvement.
 - Nine-source manifest is the number of declared trusted document sources,
   not nine successfully loaded documents. Check the latest ingestion audit.
 - 768 is the embedding dimension configured in `knowledge.py`.
-- CI workflow is implemented. Do not say hosted CI passed until its run is verified.
+- CI workflow is implemented and hosted run 34473036310 passed both jobs.
 - Local benchmark reports record the base commit with a dirty-worktree flag;
   retain these changes alongside them for reproducibility.
