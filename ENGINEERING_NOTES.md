@@ -811,6 +811,73 @@ of text without JavaScript; several documented PDF links return HTML shells or
 result to S3. Documents that will not download have to be saved from a browser
 and ingested from disk.
 
+### Task 8 verification snapshot (2026-09-10)
+
+This is a measured takeover record, not a claim that the whole corpus was
+accepted. The backend virtual environment already contained the exact offline
+tool versions, so no dependency download was restarted. `python -m pytest tests
+-q` passed **99 tests** (0.93s first run, 1.06s final run); `eval/test_feedback.py`
+exited zero but reported that live assertions require `FEEDBACK_EVAL_LIVE=1`.
+The frontend suite passed **1/1** tests with a React `act` deprecation warning.
+
+Raw SHA-256 source hashes observed locally were:
+
+| Source | SHA-256 |
+|---|---|
+| PM-KISAN | `ae82cac83f61a5fa5049387a7c13e00c6d55cef0e9163deb5497dc86c86d697f` |
+| PMFBY browser artifact | `5252ce3a62b66a448e083d87405c7ab8f8d50a360a8b5df6f97dfbfe9008c875` |
+| Soil Health Card | `b2b6fcae4ffc3a12080bc35e92d929db86b8106aaf51d3af20dce0cbeb869180` |
+| NHB cold chain | `ca819fcb64cfbaf42387f92777dbe44945bb6e9692a86245c4738565e1f3866b` |
+| PAU Kharif | `30142d84b17afce725fe48bc5458b03bc029f3d57734e322bf5290a84f7215c0` |
+| PAU Rabi | `11f45d16eb28fc621f74c1826a3da72307cf09c1200f64a1ef51524703b34075` |
+| CIB&RC insecticide | `20fcd282d572e953815b56e8a2b83027da667ec844cf7bdfabb043daec315838` |
+| CIB&RC fungicide | `2662c8f376bfa831743b105c1386185357b86230e0646f7a09bc00b652b5809f` |
+| CIB&RC biofungicide | `a993757ec05e80b0a9aca970d3772f4153efc934611950cd4105252f8c8f0156` |
+| CIB&RC herbicide | `80d8c8ada76a90ab490f1d3a40cb65b2c0fa03f7c3cbc866d99d798e5345a478` |
+| CIB&RC PGR | `ed0ca2988f896f4c4bd3cd931af1d713bda4b6a458999cac36e5c1785c7c5f19` |
+| CIB&RC bioinsecticide | `f9fe03458a57a0d1da39b9e901b018616faec5d3fe6bbfc0524d3bc83b3ed062` |
+
+Six retained manifest documents parsed to 3,101 chunks in dry-run: PM-KISAN
+38, PMFBY 805, Soil Health Card 8, NHB 971, PAU Kharif 683, and PAU Rabi 596.
+The active corpus was not expanded beyond **38 PM-KISAN chunks**. A complete
+`ingest_docs.py --all` run was withheld because three manifest sources remained
+unavailable and the CLI has no aggregate deadline across 3,063 possible
+60-second embedding calls. The unchanged PM-KISAN source was ingested twice and
+each run reported `skipped; parsed=38 stored=0 rejected=0`.
+
+The CIB&RC dry-run parsed 2,466 rows: biofungicide 52, bioinsecticide 78,
+fungicide 826, herbicide 336, insecticide 1,102, and PGR 72. The transactional
+load completed six audit runs and stored **2,456** `pesticide_uses`, matching the
+prior measured total. Ten parsed rows share an existing `(product, crop, pest)`
+upsert key, which exactly explains the difference; no count was forced.
+
+At verification, Neon reported **38 documents**, **2,456 pesticide uses**, and
+**0 MSP commodities**. Structured cotton/bollworm retrieval returned registered
+uses; cotton/elephant correctly did not match; PM-KISAN vector retrieval returned
+the canonical guideline at similarity `0.7678940667949309`. The current health
+endpoint reported Neon, Earth Engine, Gemini, weather, and pgvector ready, and
+reported the MSP store explicitly unready with zero commodities.
+
+The required live evaluations were run once each: **3 passed, 2 failed, 0
+errored**. Passed: `kb_answers_from_the_document`, `script_punjabi`, and
+`profile_supplies_the_crop`. Failed:
+`unsupported_fertilizer_quantity_is_removed` did not include its required
+soil-test/KVK/agriculture-officer advice, and `dose_registered` returned only a
+follow-up question after the doses tool ran. The harness prints no query latency,
+so no latency number is claimed.
+
+Unavailable source and acceptance steps are intentionally explicit. PIB KCC
+returned HTTP 403 to automation (though its browser page rendered but could not
+be exported); eNAM's declared PDF URL rendered its home page; ICAR's official
+certificate was expired. The two required PIB MSP pages could not be read after
+automation returned 403 and the browser fallback became unavailable, so no MSP
+CSV was created or loaded. The backend fertilizer route used `kb`, `soil`, and
+`weather` without giving a quantity. The PM-KISAN route used `kb` and the
+official URL but did not name its official authority. The frontend compiled and
+its unit test passed, but browser submission of the two routes could not be
+observed because browser navigation was unavailable. These are acceptance gaps,
+not substituted sources or inferred results.
+
 ### Open-Meteo rate limits by IP, and the IP is shared
 
 Weather worked locally in 2s and failed in production. The cause was

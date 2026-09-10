@@ -103,6 +103,49 @@ cp .env.example .env                                # gateway creds + AI_ENDPOIN
 uvicorn app:app --host 0.0.0.0 --port 5000
 ```
 
+### Verified corpus operations
+
+The source catalog is `AnnaData-Backend-main/data/source_manifest.json`. Its
+entries are deliberately narrow: `official` is a Government of India source,
+`extension` is state-specific agricultural extension guidance, and `reference`
+is context only and never authorizes a scheme amount, MSP, fertiliser quantity,
+or pesticide dose.
+
+Source artifacts under `data/downloads/` and CIB&RC PDFs under `data/cibrc/`
+are intentionally ignored by Git. Keep the catalog and ingestion code tracked;
+fetch source files again from their exact catalog URLs rather than committing
+them. From a fresh, empty downloads directory:
+
+```bash
+cd AnnaData-Backend-main
+source .venv/bin/activate
+python -m pip install -r requirements-tools.txt
+python tools/ingest_docs.py --all --fetch --dry-run
+python tools/ingest_docs.py --all
+python tools/ingest_docs.py --all              # unchanged content should skip
+
+python tools/fetch_cibrc.py --out data/cibrc --timeout 60
+python tools/load_cibrc.py --dry-run
+python tools/load_cibrc.py
+
+# Only after transcribing the current PIB table into this ignored CSV.
+python tools/load_msp.py --csv data/downloads/msp-current.csv --year 2026-27 \
+  --source-url 'https://www.pib.gov.in/PressReleasePage.aspx?PRID=2269182&lang=1&reg=3'
+```
+
+`--fetch` currently re-fetches every HTTP catalog entry, so do not run it over
+valid inherited artifacts during a recovery. Validate those files with
+`python tools/ingest_docs.py --all --dry-run`, and fetch a missing source by ID
+instead. Browser-only sources must be saved from their exact manifest URL to
+the declared ignored path before the dry run.
+
+`GET /health` returns `status` plus an `integrations` object. Each configured
+provider exposes configured versus ready state; `database`, `earth_engine`, and
+`gemini` expose their initialization state; `knowledge` exposes provider,
+document and pesticide-use counts, and recent ingestion audits; `msp` exposes
+its readiness and commodity count. A configured-but-unready provider makes the
+top-level status `degraded`.
+
 ---
 
 ## 3. SMS setup (Cloud mode)
@@ -213,7 +256,7 @@ container host.
 ## 5. Verifying a deploy
 
 ```bash
-curl https://<backend>/health          # features map: which integrations are live
+curl https://<backend>/health          # status + configured/ready integrations and corpus counts
 curl https://<sms-bridge>/health       # status "ok" or "degraded" + specific problems
 
 curl -X POST https://<backend>/agent \
