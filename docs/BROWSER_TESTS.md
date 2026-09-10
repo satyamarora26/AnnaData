@@ -17,7 +17,7 @@ output, and `CHROME_PATH` to use an existing Chrome executable. The default
 evidence directory is `/tmp/annadata-browser-evidence`. `NODE_PATH` can point to
 an existing runtime's Playwright package instead of installing another copy.
 
-Default mode mocks only `/agent`: it tests answer rendering, composer layout,
+Default mode mocks only `/agent/stream`: it tests answer rendering, composer layout,
 HTTP 429 error presentation, and recovery. Its timings are not backend latency.
 Live mode performs two actual public chat requests, one per viewport. It checks
 that a PM-KISAN answer is received, contains the expected annual amount, has no

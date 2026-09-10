@@ -20,6 +20,7 @@ import startup
 from Agent import run_agent
 from process_media import process_media
 from api_security import APISecurityMiddleware, require_service_token
+from chat_stream import progress_response
 
 @asynccontextmanager
 async def lifespan(_app: FastAPI):
@@ -129,12 +130,26 @@ def health():
 
 @app.post("/agent")
 def run_agent_endpoint(request: QueryRequest, http_request: Request):
+    _validate_agent_request(request, http_request)
+    return _agent_response(request)
+
+
+@app.post("/agent/stream")
+def stream_agent_endpoint(request: QueryRequest, http_request: Request):
+    _validate_agent_request(request, http_request)
+    return progress_response(lambda progress: _agent_response(request, progress))
+
+
+def _validate_agent_request(request: QueryRequest, http_request: Request):
     channel = (request.channel or "web").strip().lower()
     if request.user_id is not None or channel == "sms":
         require_service_token(http_request)
     if not request.query or not request.query.strip():
         raise HTTPException(status_code=400, detail="query must not be empty")
 
+
+def _agent_response(request: QueryRequest, on_progress=None):
+    channel = (request.channel or "web").strip().lower()
     user_id = (request.user_id or "").strip() or None
 
     profile = profile_store.get_profile(user_id) if user_id else None
@@ -166,6 +181,7 @@ def run_agent_endpoint(request: QueryRequest, http_request: Request):
             history=history,
             channel=channel,
             profile=profile,
+            **({"on_progress": on_progress} if on_progress else {}),
         )
     except Exception as e:
         # Previously this returned 200 with an {"error": ...} body, so callers

@@ -20,7 +20,7 @@ async function main() {
         navigator.geolocation.getCurrentPosition = (_, fail) => fail({ code: 1, message: 'Test denies location' });
       });
       if (!live) {
-        await page.route('**/agent', route => route.fulfill({
+        await page.route('**/agent/stream', route => route.fulfill({
           json: { answer: 'PM-KISAN provides Rs. 6,000 per year in three installments. Source: official guidelines.' },
         }));
       }
@@ -29,6 +29,13 @@ async function main() {
       await input.fill('How much does PM-KISAN pay each year?');
       const start = Date.now();
       await input.press('Enter');
+      if (live) {
+        await page.waitForFunction(() => {
+          const status = document.querySelector('[role="status"]');
+          return status && /Understanding|Checking|Preparing/.test(status.textContent);
+        }, null, { timeout: 90000 });
+        await page.screenshot({ path: path.join(output, `progress-${viewport.width}.png`) });
+      }
       await page.locator('.result-data').first().waitFor({ timeout: 180000 });
       const answer = await page.locator('.result-data').first().innerText();
       assert.match(answer, /6[,.]?000/);
@@ -42,8 +49,8 @@ async function main() {
       await page.screenshot({ path: path.join(output, `${live ? 'live' : 'mock'}-${viewport.width}.png`), fullPage: true });
       results.push({ viewport, mode: live ? 'live provider' : 'mocked backend', answerReceived: true, elapsedMs: Date.now() - start });
       if (!live) {
-        await page.unroute('**/agent');
-        await page.route('**/agent', route => route.fulfill({ status: 429, json: { detail: 'Too many requests. Please retry later.' } }));
+        await page.unroute('**/agent/stream');
+        await page.route('**/agent/stream', route => route.fulfill({ status: 429, json: { detail: 'Too many requests. Please retry later.' } }));
         await input.fill('Second request');
         await input.press('Enter');
         await page.getByText(/Sorry, could not reach.*429/).waitFor();

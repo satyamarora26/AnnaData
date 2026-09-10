@@ -1,5 +1,6 @@
 """Offline HTTP regressions; no lifespan startup, database or provider calls."""
 import asyncio
+import json
 from concurrent.futures import ThreadPoolExecutor
 import importlib.util
 from pathlib import Path
@@ -66,6 +67,103 @@ def test_public_web_contract_and_preflight(client):
     })
     assert preflight.status_code == 200
     assert preflight.headers["access-control-allow-origin"] == ORIGIN
+
+
+def test_chat_stream_sends_stages_and_only_completed_answer(client, monkeypatch):
+    result = app.run_agent()
+    def answer(**kwargs):
+        kwargs["on_progress"]("retrieving")
+        kwargs["on_progress"]("private query must not be streamed")
+        kwargs["on_progress"]("checking")
+        return result
+    monkeypatch.setattr(app, "run_agent", answer)
+    response = client.post("/agent/stream", json={"query": "hello"},
+                           headers={"Origin": ORIGIN})
+    assert response.status_code == 200
+    assert response.headers["content-type"].startswith("text/event-stream")
+    assert response.headers["access-control-allow-origin"] == ORIGIN
+    events = [json.loads(line[6:]) for line in response.text.splitlines()
+              if line.startswith("data: ")]
+    assert events[0] == {"type": "status", "stage": "connected"}
+    assert {"type": "status", "stage": "retrieving"} in events
+    assert events[-1]["type"] == "result"
+    assert events[-1]["answer"] == "Offline answer"
+    assert "answer" not in events[0]
+    assert "private query" not in response.text
+
+
+def test_chat_stream_preserves_validation_and_access_controls(client):
+    for fields in ({"user_id": "farmer"}, {"channel": "sms"}):
+        response = client.post("/agent/stream", json={"query": "hello", **fields})
+        assert response.status_code == 401
+    assert client.post("/agent/stream", json={"query": " "}).status_code == 400
+    assert client.post("/agent/stream", json={"query": "x" * 1024}).status_code == 413
+
+
+def test_chat_stream_returns_sanitized_terminal_error(client, monkeypatch):
+    def fail(**kwargs):
+        raise RuntimeError("private-provider-secret")
+    monkeypatch.setattr(app, "run_agent", fail)
+    response = client.post("/agent/stream", json={"query": "hello"})
+    assert '"type": "error"' in response.text
+    assert '"type": "result"' not in response.text
+    assert "private-provider-secret" not in response.text
+
+
+def test_chat_stream_never_sends_an_unguarded_dose(client, monkeypatch):
+    import Agent
+    monkeypatch.setattr(app, "run_agent", Agent.run_agent)
+    monkeypatch.setattr(Agent, "get_farming_query", lambda query, history: query)
+    monkeypatch.setattr(Agent, "extract_farm_info", lambda *a, **kw: {
+        "crop_type": "cotton", "intent": "disease_pest", "message_type": "question",
+    })
+    monkeypatch.setattr(Agent.knowledge, "documents_loaded", lambda: True)
+    monkeypatch.setattr(Agent, "gather", lambda *a, **kw: {})
+    monkeypatch.setattr(Agent, "get_farming_advice", lambda *a, **kw:
+                        "Spray 500 ml per hectare. Remove affected leaves.")
+    response = client.post("/agent/stream", json={"query": "Cotton pest treatment?"})
+    assert response.status_code == 200
+    assert "500 ml" not in response.text
+    assert "Remove affected leaves" in response.text
+    assert '"stage": "checking"' in response.text
+
+
+def test_disconnected_stream_waits_for_outstanding_work():
+    import threading
+    import anyio
+    from chat_stream import progress_response
+    release = threading.Event()
+
+    def work(progress):
+        progress("retrieving")
+        assert release.wait(3), "test must release provider work"
+        return {"answer": "Checked answer"}
+
+    async def exercise():
+        disconnected = anyio.Event()
+        finished = anyio.Event()
+        async def send(message):
+            if b'retrieving' in message.get("body", b""):
+                disconnected.set()
+        async def receive():
+            await disconnected.wait()
+            return {"type": "http.disconnect"}
+        async def serve():
+            try:
+                await progress_response(work)(
+                    {"type": "http", "asgi": {"spec_version": "2.3"}}, receive, send)
+            finally:
+                finished.set()
+        async with anyio.create_task_group() as tasks:
+            tasks.start_soon(serve)
+            await disconnected.wait()
+            try:
+                await anyio.sleep(0.03)
+                assert not finished.is_set(), "request slot must outlive provider work"
+            finally:
+                release.set()
+        assert finished.is_set()
+    anyio.run(exercise)
 
 
 @pytest.mark.parametrize("fields", [

@@ -10,7 +10,7 @@ import MediaPreview from "../MediaPreview/MediaPreview";
 import { getApiUrl } from "../../Config/api";
 
 function Main() {
-  const { onSent, responses, loading, setInput, input, recentPrompt, setResponses, setLoading } = useContext(Context);
+  const { onSent, responses, loading, progress, setInput, input, recentPrompt, setResponses, setLoading } = useContext(Context);
   const { dataSent, setDataSent } = useContext(Context);
 
   const [selectedImage, setSelectedImage] = useState(null);
@@ -200,6 +200,16 @@ function Main() {
                     <img src={assets.user_icon} alt="User" className="w-10 h-10 rounded-full mr-2" />
                     <p className="text-xl font-semibold">{recentPrompt}</p>
                   </div>
+                  <p role="status" aria-live="polite" className="text-sm text-gray-600">
+                    {{
+                      connecting: 'Connecting to AnnaData...',
+                      connected: 'Connected. Starting your request...',
+                      understanding: 'Understanding your question...',
+                      retrieving: 'Checking relevant sources and data...',
+                      composing: 'Preparing your answer...',
+                      checking: 'Checking the answer against sources...',
+                    }[progress] || 'Processing your request...'}
+                  </p>
                   <hr className="border-none w-full max-w-[800px] h-[20px] bg-gradient-to-r from-[#9ed7ff] via-[#ffffff] to-[#9ed7ff] hr-animated" />
                   <hr className="border-none w-full max-w-[800px] h-[20px] bg-gradient-to-r from-[#9ed7ff] via-[#ffffff] to-[#9ed7ff] hr-animated" />
                   <hr className="border-none w-full max-w-[800px] h-[20px] bg-gradient-to-r from-[#9ed7ff] via-[#ffffff] to-[#9ed7ff] hr-animated" />

@@ -17,6 +17,7 @@ secrets or stop an existing service.
 | --- | --- |
 | `GET/HEAD /`, `GET/HEAD /health` | Public; excluded from request-rate limits |
 | `POST /agent` without an identity, with the default/web channel | Public, stateless, rate and body limited |
+| `POST /agent/stream` | Same payload and access controls as `/agent`; progress-only SSE |
 | `POST /api/chat/describe` | Public, rate and upload limited |
 | `POST /agent` with any non-null `user_id` or `channel=sms` | Service bearer token required before profile/history access or agent execution |
 | All `/feedback/*` endpoints, including due and summary | Service bearer token required |
@@ -39,6 +40,26 @@ Concurrent admission is checked first and returns `503` with `Retry-After: 1`
 when full. An incomplete request body exceeding its total deadline returns `408`.
 
 ## Operator Configuration
+
+### Chat Progress Stream
+
+The web client posts to `/agent/stream`. Each SSE `data:` frame is JSON with a
+`type`: `status`, `result`, or `error`. Status frames carry only a fixed stage
+identifier, never queries, raw model text, or provider errors. A `result` carries
+the existing `/agent` response after normal agent processing and output guards.
+Ten-second SSE comments keep active connections from appearing silent. A
+terminal error is generic because HTTP headers have already been sent.
+
+This is live processing progress, **not token-by-token generation**. There is
+no artificial typing delay. Existing non-streaming clients can keep `/agent`.
+The browser bounds optional GPS waiting to one second and sends only previous
+turns as history; the current query has its own field. Requests time out after
+three minutes. Disconnecting does not abandon running provider work or release
+its admission slot early. Provider timeouts still govern underlying execution.
+
+Deploy the backend before the frontend, since the new UI uses the new route.
+No new secrets, services, or paid hosting are required. Streaming cannot remove
+the free host's idle-start delay or shorten the provider's own processing time.
 
 For the public demo, configure only the provider credentials needed for public
 chat and approved knowledge retrieval, the frontend URL, and the limits below.

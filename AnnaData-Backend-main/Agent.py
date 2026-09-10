@@ -570,8 +570,14 @@ def run_agent(
     history: Optional[List[dict]] = None,
     channel: str = "web",
     profile: Optional[dict] = None,
+    on_progress=None,
 ) -> AgentResult:
     """Answer a farmer's question and report what was learned and used."""
+    def progress(stage):
+        if on_progress is not None:
+            on_progress(stage)
+
+    progress("understanding")
     query_final = get_farming_query(query, history)
     print(f"Final query after refinement: {query_final}")
 
@@ -648,6 +654,7 @@ def run_agent(
 
     # A location named in this message beats a remembered or browser one, but
     # only if geocoding actually resolves it.
+    progress("retrieving")
     lat, lon = latitude, longitude
     if _known(location):
         geo_lat, geo_lon = get_location(facts["location"])
@@ -694,6 +701,7 @@ def run_agent(
         )
 
     if not tools:
+        progress("composing")
         return AgentResult(
             extract_markdown_content(get_open_ended_answer(query_final, history, channel)),
             tools_used=["general"], missing_slots=missing, intent=intent, **facts
@@ -710,12 +718,14 @@ def run_agent(
         "script": script_of(query),
     }
 
+    progress("composing")
     final_response = extract_markdown_content(
         get_farming_advice(facts["location"], facts["state"], facts["crop"],
                            gathered, query, channel, history=history)
     )
     # A price or a subsidy is a number a farmer acts on. If nothing retrieved
     # supports it, no sentence claiming one survives, whatever the model wrote.
+    progress("checking")
     final_response, _ = output_guards.scrub(final_response, gathered)
     return AgentResult(
         final_response, tools_used=sorted(tools),

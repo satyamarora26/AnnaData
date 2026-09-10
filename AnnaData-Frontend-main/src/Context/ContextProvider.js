@@ -9,6 +9,7 @@ const ContextProvider = (props) => {
   const [previousPrompt, setPreviousPrompt] = useState([]);
   const [showResult, setShowResult] = useState(false);
   const [loading, setLoading] = useState(false);
+  const [progress, setProgress] = useState('');
   const [resultData, setResultData] = useState('');
   const [responses, setResponses] = useState([]);
   const [dataSent, setDataSent] = useState(false);
@@ -35,15 +36,15 @@ const ContextProvider = (props) => {
         }
         return historyArray;
     });
-    const updatedHistory = [...history, { role: "user", content: input }];
     setLoading(true);
+    setProgress('connecting');
     setShowResult(true);
     setRecentPrompt(input);
     setPreviousPrompt((prevPrompts) => [...prevPrompts, input]);
 
     try {
       // Raw markdown is passed straight through; <Markdown> renders it.
-      const response = await run(input, updatedHistory);
+      const response = await run(input, history, setProgress);
       const answer = response || "No response received.";
       setResponses((prevResponses) => [...prevResponses, { prompt: input, response: answer }]);
       setResultData(answer);
@@ -55,6 +56,7 @@ const ContextProvider = (props) => {
     }
 
     setLoading(false);
+    setProgress('');
     setInput("");
   };
 
@@ -66,6 +68,7 @@ const ContextProvider = (props) => {
     recentPrompt,
     showResult,
     loading,
+    progress,
     resultData,
     responses,
     setResponses,

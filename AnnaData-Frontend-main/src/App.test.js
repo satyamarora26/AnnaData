@@ -65,16 +65,26 @@ test('submits a typed query and renders the backend answer without adding a quan
 
     await waitFor(() => expect(global.fetch).toHaveBeenCalledTimes(1));
     const [url, options] = global.fetch.mock.calls[0];
-    expect(url).toMatch(/\/agent$/);
+    expect(url).toMatch(/\/agent\/stream$/);
     expect(options.method).toBe('POST');
     expect(JSON.parse(options.body)).toEqual({
       query,
-      history: [{ role: 'user', content: query }],
+      history: [],
       latitude: 30.9,
       longitude: 75.5,
     });
     expect(await screen.findByText(answer)).toBeInTheDocument();
     expect(screen.queryByText(/\b\d+(?:\.\d+)?\s*(?:kg|g|ml|litres?)\b/i)).not.toBeInTheDocument();
+
+    const followUp = 'What about irrigation?';
+    await act(async () => {
+      await userEvent.type(input, `${followUp}{enter}`);
+    });
+    await waitFor(() => expect(global.fetch).toHaveBeenCalledTimes(2));
+    expect(JSON.parse(global.fetch.mock.calls[1][1].body).history).toEqual([
+      { role: 'user', content: query },
+      { role: 'assistant', content: answer },
+    ]);
   } finally {
     act(() => root.unmount());
     container.remove();
