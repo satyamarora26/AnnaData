@@ -128,13 +128,55 @@ def test_chat_stream_never_sends_an_unguarded_dose(client, monkeypatch):
     assert '"stage": "checking"' in response.text
 
 
+def test_chat_stream_emits_checked_deltas_from_model_before_final_result(client, monkeypatch):
+    import Agent
+    monkeypatch.setattr(app, "run_agent", Agent.run_agent)
+    monkeypatch.setattr(Agent, "get_farming_query", lambda query, history: query)
+    monkeypatch.setattr(Agent, "extract_farm_info", lambda *a, **kw: {
+        "crop_type": "cotton", "intent": "disease_pest", "message_type": "question",
+    })
+    monkeypatch.setattr(Agent.knowledge, "documents_loaded", lambda: True)
+    monkeypatch.setattr(Agent, "gather", lambda *a, **kw: {})
+    monkeypatch.setattr(Agent, "llm", SimpleNamespace(stream=lambda messages: iter([
+        SimpleNamespace(content="Remove affected leaves. "),
+        SimpleNamespace(content="Spray 500 ml per hectare. "),
+        SimpleNamespace(content="Ask your agriculture officer."),
+    ])))
+    response = client.post("/agent/stream", json={"query": "Cotton pest treatment?"})
+    events = [json.loads(line[6:]) for line in response.text.splitlines()
+              if line.startswith("data: ")]
+    deltas = [event["text"] for event in events if event["type"] == "delta"]
+    assert deltas
+    assert "500 ml" not in response.text
+    assert "Remove affected leaves." in ''.join(deltas)
+    assert events[-1]["type"] == "result"
+    assert events[-1]["answer"] == ''.join(deltas).strip()
+
+
+def test_named_scheme_cannot_bypass_retrieval_with_parser_quick_answer(client, monkeypatch):
+    import Agent
+    monkeypatch.setattr(app, "run_agent", Agent.run_agent)
+    monkeypatch.setattr(Agent, "get_farming_query", lambda query, history: query)
+    monkeypatch.setattr(Agent, "extract_farm_info", lambda *a, **kw: {
+        "crop_type": "unknown", "intent": "general", "message_type": "question",
+        "answer": "Unverified parser answer",
+    })
+    monkeypatch.setattr(Agent.knowledge, "documents_loaded", lambda: True)
+    monkeypatch.setattr(Agent, "gather", lambda *a, **kw: {})
+    monkeypatch.setattr(Agent, "get_farming_advice", lambda *a, **kw: "Checked source answer")
+    response = client.post("/agent", json={"query": "How much does PM-KISAN pay each year?"})
+    assert response.json()["intent"] == "scheme_subsidy"
+    assert response.json()["tools_used"] == ["kb"]
+    assert "Unverified" not in response.text
+
+
 def test_disconnected_stream_waits_for_outstanding_work():
     import threading
     import anyio
     from chat_stream import progress_response
     release = threading.Event()
 
-    def work(progress):
+    def work(progress, on_text):
         progress("retrieving")
         assert release.wait(3), "test must release provider work"
         return {"answer": "Checked answer"}

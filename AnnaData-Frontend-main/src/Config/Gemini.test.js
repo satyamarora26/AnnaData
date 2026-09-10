@@ -80,17 +80,22 @@ describe('optional browser location', () => {
     });
     global.fetch.mockResolvedValue(streamResponse(
       ': keep-alive\n\ndata: {"type":"status","stage":"retrieving"}\n\n' +
+      'data: {"type":"delta","text":"Verified ₹"}\n\n' +
+      'data: {"type":"delta","text":"6,000"}\n\n' +
       'data: {"type":"result","answer":"Verified ₹6,000"}\n\n'
     ));
     const progress = jest.fn();
-    const answer = await run('PM-KISAN?', [], progress);
+    const text = jest.fn();
+    const answer = await run('PM-KISAN?', [], progress, text);
     expect(progress).toHaveBeenCalledWith('retrieving');
+    expect(text.mock.calls.map(([chunk]) => chunk)).toEqual(['Verified ₹', '6,000']);
     expect(answer).toBe('Verified ₹6,000');
   });
 
   test.each([
     ['data: {"type":"status","stage":"composing"}\n\n', /ended before/],
     ['data: {"type":"error","detail":"Agent is temporarily unavailable"}\n\n', /temporarily unavailable/],
+    ['data: {"type":"delta","text":"Checked first sentence."}\n\n', /interrupted before completion/],
   ])('recovers when the stream fails instead of returning a partial answer', async (frames, expected) => {
     Object.defineProperty(navigator, 'geolocation', {
       configurable: true, value: { getCurrentPosition: (_, fail) => fail() },

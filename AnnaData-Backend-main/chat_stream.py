@@ -1,4 +1,4 @@
-"""Progress-only SSE: model output is released only after the agent returns."""
+"""SSE for progress and sentence-checked text, followed by a final result."""
 import json
 
 import anyio
@@ -20,11 +20,15 @@ def progress_response(run):
                 if stage in STAGES:
                     anyio.from_thread.run(sender.send, {"type": "status", "stage": stage})
 
+            def text(checked_text):
+                if checked_text:
+                    anyio.from_thread.run(sender.send, {"type": "delta", "text": checked_text})
+
             async def work():
                 # Do not abandon a still-running provider call on disconnect:
                 # admission middleware must retain its slot until work stops.
                 try:
-                    result = await anyio.to_thread.run_sync(lambda: run(progress))
+                    result = await anyio.to_thread.run_sync(lambda: run(progress, text))
                     await sender.send({"type": "result", **result})
                 except Exception:
                     await sender.send({"type": "error", "detail":

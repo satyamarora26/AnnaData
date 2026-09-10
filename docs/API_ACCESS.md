@@ -17,7 +17,7 @@ secrets or stop an existing service.
 | --- | --- |
 | `GET/HEAD /`, `GET/HEAD /health` | Public; excluded from request-rate limits |
 | `POST /agent` without an identity, with the default/web channel | Public, stateless, rate and body limited |
-| `POST /agent/stream` | Same payload and access controls as `/agent`; progress-only SSE |
+| `POST /agent/stream` | Same payload and access controls as `/agent`; progress and checked-answer SSE |
 | `POST /api/chat/describe` | Public, rate and upload limited |
 | `POST /agent` with any non-null `user_id` or `channel=sms` | Service bearer token required before profile/history access or agent execution |
 | All `/feedback/*` endpoints, including due and summary | Service bearer token required |
@@ -44,14 +44,22 @@ when full. An incomplete request body exceeding its total deadline returns `408`
 ### Chat Progress Stream
 
 The web client posts to `/agent/stream`. Each SSE `data:` frame is JSON with a
-`type`: `status`, `result`, or `error`. Status frames carry only a fixed stage
+`type`: `status`, `delta`, `result`, or `error`. Status frames carry only a fixed stage
 identifier, never queries, raw model text, or provider errors. A `result` carries
 the existing `/agent` response after normal agent processing and output guards.
+Each `delta` contains a `text` field with completed, checked answer sentences.
+The browser appends these as they arrive; the final result is authoritative.
 Ten-second SSE comments keep active connections from appearing silent. A
 terminal error is generic because HTTP headers have already been sent.
 
-This is live processing progress, **not token-by-token generation**. There is
-no artificial typing delay. Existing non-streaming clients can keep `/agent`.
+The model generates through its streaming API. Incomplete sentences are buffered
+before claim checks; accepted text is released immediately, without an artificial
+typing delay. This is **sentence-checked answer streaming**, not unrestricted
+raw-token display. Whole-answer markdown fences are buffered until they can be
+unwrapped safely; short or already-composed direct answers can arrive at once.
+Provider reasoning blocks are not shown. If generation fails after partial text,
+the UI replaces it with an explicit interruption message, not a completed answer.
+Existing non-streaming clients can keep `/agent`.
 The browser bounds optional GPS waiting to one second and sends only previous
 turns as history; the current query has its own field. Requests time out after
 three minutes. Disconnecting does not abandon running provider work or release

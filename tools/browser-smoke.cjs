@@ -5,6 +5,7 @@ const { chromium } = require('playwright');
 
 async function main() {
   const live = process.argv.includes('--live');
+  const answerStream = process.argv.includes('--answer-stream');
   const url = process.env.APP_URL || 'http://127.0.0.1:3000';
   const output = process.env.EVIDENCE_DIR || '/tmp/annadata-browser-evidence';
   await fs.mkdir(output, { recursive: true });
@@ -26,8 +27,11 @@ async function main() {
       }
       await page.goto(url);
       const input = page.getByPlaceholder('Enter a prompt here');
-      await input.fill('How much does PM-KISAN pay each year?');
+      await input.fill(answerStream
+        ? 'What are the eligibility rules and exclusions for the PM-KISAN scheme?'
+        : 'How much does PM-KISAN pay each year?');
       const start = Date.now();
+      let firstTextMs = null;
       await input.press('Enter');
       if (live) {
         await page.waitForFunction(() => {
@@ -36,9 +40,16 @@ async function main() {
         }, null, { timeout: 90000 });
         await page.screenshot({ path: path.join(output, `progress-${viewport.width}.png`) });
       }
+      if (answerStream) {
+        const partial = page.locator('.streaming-answer');
+        await partial.waitFor({ timeout: 180000 });
+        assert((await partial.innerText()).trim().length > 0);
+        firstTextMs = Date.now() - start;
+        await page.screenshot({ path: path.join(output, `partial-${viewport.width}.png`) });
+      }
       await page.locator('.result-data').first().waitFor({ timeout: 180000 });
       const answer = await page.locator('.result-data').first().innerText();
-      assert.match(answer, /6[,.]?000/);
+      assert.match(answer, answerStream ? /PM-KISAN/i : /6[,.]?000/);
       assert.doesNotMatch(answer, /could not reach|API error/i);
       const box = await input.boundingBox();
       const send = await page.locator('button[type="submit"]').boundingBox();
@@ -47,7 +58,8 @@ async function main() {
       assert.equal(overflow, false, 'Page must not overflow horizontally');
       assert.deepEqual(errors, [], 'No uncaught browser errors');
       await page.screenshot({ path: path.join(output, `${live ? 'live' : 'mock'}-${viewport.width}.png`), fullPage: true });
-      results.push({ viewport, mode: live ? 'live provider' : 'mocked backend', answerReceived: true, elapsedMs: Date.now() - start });
+      results.push({ viewport, mode: live ? 'live provider' : 'mocked backend', answerReceived: true,
+        ...(answerStream ? { partialAnswerVisible: true, firstTextMs } : {}), elapsedMs: Date.now() - start });
       if (!live) {
         await page.unroute('**/agent/stream');
         await page.route('**/agent/stream', route => route.fulfill({ status: 429, json: { detail: 'Too many requests. Please retry later.' } }));

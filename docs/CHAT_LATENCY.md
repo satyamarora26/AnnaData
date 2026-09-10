@@ -38,7 +38,7 @@ The production frontend build and mocked desktop/mobile browser checks passed.
 
 ## Public Deployment Verification
 
-Both Render services are live on commit `0fe09a3`:
+The progress-only release was verified on commit `0fe09a3`:
 
 - Backend deploy: `dep-dahf1mm743jc73cmujrg` (completed before frontend deployment).
 - Frontend deploy: `dep-dahf3d6k1f9s73fis860`.
@@ -54,3 +54,29 @@ live processing status before answers, with no horizontal overflow or uncaught
 browser errors. Observed overall times were 11.513 and 8.420 seconds, including
 screenshots. These are two smoke observations, not a percentile or SLA.
 Progress and answer screenshots were visually reviewed.
+
+## Sentence-Checked Answer Streaming
+
+The next iteration uses the provider's streaming API and releases completed
+sentences after existing claim checks, instead of withholding the whole answer.
+No synthetic typing animation or sleeps are used. Referrals and source labels
+are appended once at completion; unsupported claims are discarded before any
+text event is emitted. Named scheme questions cannot bypass retrieval through
+the parser's quick-answer field. Short direct answers can still arrive at once.
+
+An unfinished sentence or whole-answer markdown fence waits until complete.
+The existing pattern-based claim checks are not a guarantee that every generated
+statement is correct. Initial parsing, retrieval, and free-host wake-up latency
+remain; streaming improves progressive delivery, not those preceding steps.
+
+Local verification with real providers produced 12 text updates before the
+final result (first text 19.927 seconds, completion 20.904 seconds). Desktop and
+mobile browser tests observed partial answers at 13.049 and 17.010 seconds and
+completed at 13.951 and 18.398 seconds, including screenshots. These small-sample
+observations illustrate variability and must not be presented as an SLA.
+
+298 backend tests and 9 frontend tests passed. Additional coverage verifies
+delivery before generation finishes, all chunk boundaries of unsupported claims,
+split decimals/currency/units, final source labels, hidden reasoning blocks,
+bounded buffering, partial-stream failure and visible partial UI state. The
+production frontend build passed, and partial screenshots were visually checked.

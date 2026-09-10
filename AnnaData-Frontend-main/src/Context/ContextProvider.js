@@ -10,6 +10,7 @@ const ContextProvider = (props) => {
   const [showResult, setShowResult] = useState(false);
   const [loading, setLoading] = useState(false);
   const [progress, setProgress] = useState('');
+  const [partialAnswer, setPartialAnswer] = useState('');
   const [resultData, setResultData] = useState('');
   const [responses, setResponses] = useState([]);
   const [dataSent, setDataSent] = useState(false);
@@ -38,13 +39,15 @@ const ContextProvider = (props) => {
     });
     setLoading(true);
     setProgress('connecting');
+    setPartialAnswer('');
     setShowResult(true);
     setRecentPrompt(input);
     setPreviousPrompt((prevPrompts) => [...prevPrompts, input]);
 
     try {
       // Raw markdown is passed straight through; <Markdown> renders it.
-      const response = await run(input, history, setProgress);
+      const response = await run(input, history, setProgress,
+        text => setPartialAnswer(previous => previous + text));
       const answer = response || "No response received.";
       setResponses((prevResponses) => [...prevResponses, { prompt: input, response: answer }]);
       setResultData(answer);
@@ -57,6 +60,7 @@ const ContextProvider = (props) => {
 
     setLoading(false);
     setProgress('');
+    setPartialAnswer('');
     setInput("");
   };
 
@@ -69,6 +73,7 @@ const ContextProvider = (props) => {
     showResult,
     loading,
     progress,
+    partialAnswer,
     resultData,
     responses,
     setResponses,

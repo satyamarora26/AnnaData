@@ -5,6 +5,7 @@ import userEvent from '@testing-library/user-event';
 import App from './App';
 import Main from './compnent/Main/Main';
 import ContextProvider from './Context/ContextProvider';
+import { TextDecoder, TextEncoder } from 'util';
 
 test('renders the AnnaData assistant', () => {
   const container = document.createElement('div');
@@ -93,5 +94,50 @@ test('submits a typed query and renders the backend answer without adding a quan
       configurable: true,
       value: originalGeolocation,
     });
+  }
+});
+
+test('shows checked partial text while generation is still pending', async () => {
+  const originalGeolocation = navigator.geolocation;
+  const originalFetch = global.fetch;
+  const originalDecoder = global.TextDecoder;
+  const container = document.createElement('div');
+  const root = createRoot(container);
+  document.body.appendChild(container);
+  global.TextDecoder = TextDecoder;
+  Object.defineProperty(navigator, 'geolocation', {
+    configurable: true, value: { getCurrentPosition: (_, fail) => fail() },
+  });
+  const encode = event => new TextEncoder().encode(`data: ${JSON.stringify(event)}\n\n`);
+  let finish;
+  const reader = {
+    read: jest.fn()
+      .mockResolvedValueOnce({ done: false, value: encode({ type: 'delta', text: 'First checked sentence. ' }) })
+      .mockImplementationOnce(() => new Promise(resolve => { finish = resolve; })),
+    cancel: jest.fn().mockResolvedValue(),
+    releaseLock: jest.fn(),
+  };
+  global.fetch = jest.fn().mockResolvedValue({
+    ok: true, headers: { get: () => 'text/event-stream' },
+    body: { getReader: () => reader },
+  });
+  try {
+    act(() => root.render(<ContextProvider><Main /></ContextProvider>));
+    await act(async () => {
+      await userEvent.type(screen.getByPlaceholderText(/enter a prompt here/i), 'How can I prepare my field?{enter}');
+    });
+    expect(await screen.findByText('First checked sentence.')).toBeInTheDocument();
+    expect(screen.getByRole('button', { name: 'Send message' })).toBeDisabled();
+    await act(async () => finish({ done: false, value: encode({
+      type: 'result', answer: 'First checked sentence. Final checked sentence.',
+    }) }));
+    expect(await screen.findByText('First checked sentence. Final checked sentence.')).toBeInTheDocument();
+    expect(screen.getByRole('button', { name: 'Send message' })).toBeEnabled();
+  } finally {
+    act(() => root.unmount());
+    container.remove();
+    global.fetch = originalFetch;
+    global.TextDecoder = originalDecoder;
+    Object.defineProperty(navigator, 'geolocation', { configurable: true, value: originalGeolocation });
   }
 });

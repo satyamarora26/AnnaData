@@ -479,8 +479,12 @@ def _remove(category: str, reason: str) -> None:
     LOGGER.info("output_guard_removed category=%s reason=%s", category, reason)
 
 
-def scrub(answer: str, gathered: dict) -> tuple[str, bool]:
-    """Remove unsupported actionable sentences while retaining safe advice."""
+def scrub(answer: str, gathered: dict, *, finalize: bool = True) -> tuple[str, bool]:
+    """Remove unsupported actionable sentences while retaining safe advice.
+
+    Streaming units use finalize=False so referrals and citations are added
+    only once, when the complete answer is finalized.
+    """
     if not answer:
         return answer, False
 
@@ -542,6 +546,8 @@ def scrub(answer: str, gathered: dict) -> tuple[str, bool]:
         kept.append(sentence.strip())
 
     cleaned = " ".join(kept).strip() if changed else answer
+    if not finalize:
+        return cleaned, changed
     if (
         context.get("intent") == "fertiliser_nutrition"
         and _EXACT_FERTILIZER_REQUEST.search(str(context.get("query") or ""))

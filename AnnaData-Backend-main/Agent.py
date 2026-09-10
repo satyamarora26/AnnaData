@@ -5,6 +5,7 @@ from typing import List, Optional
 from langchain.schema import HumanMessage
 
 from utils import llm
+from checked_generation import generate_checked
 from Address_Convertor import get_location
 from Mandi_Price_Tool import get_state_data
 from Query_Parser import extract_farm_info
@@ -190,7 +191,15 @@ def extract_markdown_content(text: str) -> str:
     return match.group(1).strip() if match else text
 
 
-def get_open_ended_answer(query: str, history: Optional[List[dict]], channel: str = "web") -> str:
+def _compose(prompt, on_text=None, gathered=None):
+    messages = [HumanMessage(content=prompt)]
+    if on_text is not None:
+        return generate_checked(llm, messages, gathered or {}, on_text)
+    return llm.invoke(messages).content
+
+
+def get_open_ended_answer(query: str, history: Optional[List[dict]], channel: str = "web",
+                          *, on_text=None, gathered=None) -> str:
     """
     query: str - the farmer's latest question
     history: list[dict] - [{"role": "user"/"assistant", "content": "..."}]
@@ -237,10 +246,11 @@ def get_open_ended_answer(query: str, history: Optional[List[dict]], channel: st
     **Assistant's Expert Agronomic Advice:**
     """
 
-    return llm.invoke([HumanMessage(content=prompt)]).content.strip()
+    return _compose(prompt, on_text, gathered).strip()
 
 
-def answer_about_system(query: str, history, channel: str, profile=None) -> str:
+def answer_about_system(query: str, history, channel: str, profile=None,
+                        *, on_text=None, gathered=None) -> str:
     """Answer a question about the assistant itself, from what it actually does.
 
     The facts are assembled from configuration, not recalled by the model, so a
@@ -285,10 +295,10 @@ def answer_about_system(query: str, history, channel: str, profile=None) -> str:
       refusal where you have something useful to offer instead.
     """
 
-    return llm.invoke([HumanMessage(content=prompt)]).content.strip()
+    return _compose(prompt, on_text, gathered).strip()
 
 
-def handle_correction(query: str, history, channel: str) -> str:
+def handle_correction(query: str, history, channel: str, *, on_text=None, gathered=None) -> str:
     """Reply to a farmer objecting to the previous answer.
 
     Apologising and restating the same advice is what the assistant did before,
@@ -324,10 +334,10 @@ def handle_correction(query: str, history, channel: str) -> str:
     - Reply in the SAME language and SAME script the farmer used.
     """
 
-    return llm.invoke([HumanMessage(content=prompt)]).content.strip()
+    return _compose(prompt, on_text, gathered).strip()
 
 
-def greet(query: str, profile, channel: str) -> str:
+def greet(query: str, profile, channel: str, *, on_text=None, gathered=None) -> str:
     """Answer a greeting by saying what this service can actually do.
 
     A greeting previously fell through to the advice path and produced a
@@ -358,11 +368,11 @@ def greet(query: str, profile, channel: str) -> str:
     - {style}
     """
 
-    return llm.invoke([HumanMessage(content=prompt)]).content.strip()
+    return _compose(prompt, on_text, gathered).strip()
 
 
 def acknowledge_statement(query: str, facts: dict, channel: str,
-                          script_query: str = "") -> str:
+                          script_query: str = "", *, on_text=None, gathered=None) -> str:
     """Reply to a farmer who told us something rather than asking anything.
 
     Confirming what was understood is useful; volunteering a page of unrelated
@@ -391,11 +401,11 @@ def acknowledge_statement(query: str, facts: dict, channel: str,
     - {style}
     """
 
-    return llm.invoke([HumanMessage(content=prompt)]).content.strip()
+    return _compose(prompt, on_text, gathered).strip()
 
 
 def get_farming_advice(location, state, crop, gathered, farmer_query,
-                       channel: str = "web", history=None) -> str:
+                       channel: str = "web", history=None, *, on_text=None) -> str:
     """Compose the final advisory from whatever data was gathered.
 
     Only tools that actually ran appear in the prompt. Padding the context with
@@ -470,7 +480,7 @@ def get_farming_advice(location, state, crop, gathered, farmer_query,
     - Farmer's Question: {farmer_query}
     """
 
-    return llm.invoke([HumanMessage(content=prompt)]).content
+    return _compose(prompt, on_text, gathered)
 
 
 def gather(tools, *, lat, lon, state, crop, query, intent, pest=None) -> dict:
@@ -571,6 +581,7 @@ def run_agent(
     channel: str = "web",
     profile: Optional[dict] = None,
     on_progress=None,
+    on_text=None,
 ) -> AgentResult:
     """Answer a farmer's question and report what was learned and used."""
     def progress(stage):
@@ -589,6 +600,8 @@ def run_agent(
     answer = structured_input.get("answer", "unknown")
     intent = planner.normalise_intent(structured_input.get("intent"))
     message_type = planner.normalise_message_type(structured_input.get("message_type"))
+    if message_type == "question" and output_guards.extract_scheme_entities(query_final):
+        intent = "scheme_subsidy"
 
     # A farmer reporting damage is asking for help even though they phrased it
     # as a fact. "My cotton has been attacked by locusts" is grammatically a
@@ -631,11 +644,16 @@ def run_agent(
             if not facts[key] and stored:
                 facts[key] = stored
 
+    stream_options = ({"on_text": on_text, "gathered": {"_guard_context": {
+        "state": facts["state"], "crop": facts["crop"], "intent": intent,
+        "query": query, "script": script_of(query),
+    }}} if on_text is not None else {})
+
     # A question about the assistant itself is answered from what the service
     # actually does, not from the model's general knowledge of agronomy.
     if message_type == "meta":
         return AgentResult(
-            answer_about_system(query, history, channel, profile),
+            answer_about_system(query, history, channel, profile, **stream_options),
             tools_used=["about"], intent=intent, message_type=message_type, **facts
         )
 
@@ -644,12 +662,16 @@ def run_agent(
     # answer below, which would otherwise swallow it.
     if message_type == "smalltalk":
         return AgentResult(
-            greet(query, profile, channel),
+            greet(query, profile, channel, **stream_options),
             tools_used=["greeting"], intent=intent, message_type=message_type, **facts
         )
 
     # Non-agricultural query: the parser already answered it.
-    if answer != "unknown" and crop == "unknown" and state == "unknown" and location == "unknown":
+    if (intent == "general" and answer != "unknown" and crop == "unknown"
+            and state == "unknown" and location == "unknown"):
+        if on_text is not None:
+            answer, _ = output_guards.scrub(answer, stream_options["gathered"])
+            on_text(answer)
         return AgentResult(answer, tools_used=["direct"], message_type=message_type)
 
     # A location named in this message beats a remembered or browser one, but
@@ -683,7 +705,7 @@ def run_agent(
     # asked instead of apologising and repeating it.
     if message_type == "correction":
         return AgentResult(
-            handle_correction(query, history, channel),
+            handle_correction(query, history, channel, **stream_options),
             tools_used=["correction"], missing_slots=missing,
             intent=intent, message_type=message_type, **facts
         )
@@ -695,7 +717,7 @@ def run_agent(
             acknowledge_statement(query, {
                 "crop": facts["crop"], "location": facts["location"],
                 "state": facts["state"],
-            }, channel, script_query=query),
+            }, channel, script_query=query, **stream_options),
             tools_used=["acknowledge"], missing_slots=missing,
             intent=intent, message_type=message_type, **facts
         )
@@ -703,7 +725,7 @@ def run_agent(
     if not tools:
         progress("composing")
         return AgentResult(
-            extract_markdown_content(get_open_ended_answer(query_final, history, channel)),
+            extract_markdown_content(get_open_ended_answer(query_final, history, channel, **stream_options)),
             tools_used=["general"], missing_slots=missing, intent=intent, **facts
         )
 
@@ -721,7 +743,8 @@ def run_agent(
     progress("composing")
     final_response = extract_markdown_content(
         get_farming_advice(facts["location"], facts["state"], facts["crop"],
-                           gathered, query, channel, history=history)
+                           gathered, query, channel, history=history,
+                           **({"on_text": on_text} if on_text is not None else {}))
     )
     # A price or a subsidy is a number a farmer acts on. If nothing retrieved
     # supports it, no sentence claiming one survives, whatever the model wrote.

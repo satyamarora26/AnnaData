@@ -42,7 +42,7 @@ async function getCoordinates() {
   }
 }
 
-async function readProgressStream(response, onProgress) {
+async function readProgressStream(response, onProgress, onText) {
   const reader = response.body.getReader();
   const decoder = new TextDecoder();
   let buffer = "";
@@ -61,6 +61,7 @@ async function readProgressStream(response, onProgress) {
         if (!data) continue;
         const event = JSON.parse(data);
         if (event.type === "status") onProgress(event.stage);
+        if (event.type === "delta" && typeof event.text === "string") onText(event.text);
         if (event.type === "error") throw new Error("Agent is temporarily unavailable. Please retry.");
         if (event.type === "result" && typeof event.answer === "string") return event.answer;
       }
@@ -71,7 +72,7 @@ async function readProgressStream(response, onProgress) {
   }
 }
 
-async function run(prompt, history, onProgress = () => {}) {
+async function run(prompt, history, onProgress = () => {}, onText = () => {}) {
   const requestBody = { query: prompt, history };
 
   const coords = await getCoordinates();
@@ -82,6 +83,7 @@ async function run(prompt, history, onProgress = () => {}) {
 
   const controller = new AbortController();
   const timeout = setTimeout(() => controller.abort(), 180000);
+  let receivedText = false;
   try {
     const response = await fetch(`${getApiUrl()}/agent/stream`, {
       method: "POST",
@@ -103,12 +105,16 @@ async function run(prompt, history, onProgress = () => {}) {
     }
 
     if (response.headers?.get("content-type")?.includes("text/event-stream")) {
-      return await readProgressStream(response, onProgress);
+      return await readProgressStream(response, onProgress, text => {
+        receivedText = true;
+        onText(text);
+      });
     }
     const data = await response.json();
     return data.answer || "No response from agent.";
   } catch (error) {
     console.error("Error calling agent API:", error);
+    if (receivedText) return "The response was interrupted before completion. Please retry.";
     if (error.name === "AbortError") return "The request timed out. Please try again shortly.";
     return `Sorry, could not reach the AnnaData service. (${error.message})`;
   } finally {

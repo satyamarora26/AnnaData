@@ -137,7 +137,7 @@ def run_agent_endpoint(request: QueryRequest, http_request: Request):
 @app.post("/agent/stream")
 def stream_agent_endpoint(request: QueryRequest, http_request: Request):
     _validate_agent_request(request, http_request)
-    return progress_response(lambda progress: _agent_response(request, progress))
+    return progress_response(lambda progress, text: _agent_response(request, progress, text))
 
 
 def _validate_agent_request(request: QueryRequest, http_request: Request):
@@ -148,7 +148,7 @@ def _validate_agent_request(request: QueryRequest, http_request: Request):
         raise HTTPException(status_code=400, detail="query must not be empty")
 
 
-def _agent_response(request: QueryRequest, on_progress=None):
+def _agent_response(request: QueryRequest, on_progress=None, on_text=None):
     channel = (request.channel or "web").strip().lower()
     user_id = (request.user_id or "").strip() or None
 
@@ -182,6 +182,7 @@ def _agent_response(request: QueryRequest, on_progress=None):
             channel=channel,
             profile=profile,
             **({"on_progress": on_progress} if on_progress else {}),
+            **({"on_text": on_text} if on_text else {}),
         )
     except Exception as e:
         # Previously this returned 200 with an {"error": ...} body, so callers
