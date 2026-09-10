@@ -173,3 +173,55 @@ def test_reference_passage_cannot_authorize_legal_quantity():
     assert changed
     assert "5 kg" not in cleaned
     assert "Keep records" in cleaned
+
+
+def test_scheme_figure_names_retrieved_official_authority():
+    answer = "PM-KISAN provides Rs 6,000 per year."
+    gathered = {
+        "_kb_passages": [{
+            "tier": "official",
+            "content": "PM-KISAN provides Rs 6,000 per year to eligible farmers.",
+            "authority": "Department of Agriculture and Farmers Welfare, Government of India",
+        }],
+    }
+
+    cleaned, changed = output_guards.scrub(answer, gathered)
+
+    assert changed
+    assert "Rs 6,000" in cleaned
+    assert "Department of Agriculture and Farmers Welfare, Government of India" in cleaned
+
+
+def test_exact_fertilizer_question_without_evidence_adds_field_referral():
+    answer = "Use zinc fertiliser carefully."
+    gathered = {
+        "_guard_context": {
+            "intent": "fertiliser_nutrition",
+            "query": "Exactly how much zinc fertiliser should I use per acre?",
+        },
+    }
+
+    cleaned, changed = output_guards.scrub(answer, gathered)
+
+    assert changed
+    assert "soil test" in cleaned.lower()
+    assert "Krishi Vigyan Kendra" in cleaned
+
+
+def test_latin_registered_pesticide_answer_names_one_retained_record():
+    answer = "Please inspect the affected plants before spraying."
+    gathered = {
+        "_dose_records": [{
+            "product": "Acephate 75% SP",
+            "crop": "Cotton",
+            "pest": "Bollworm",
+            "dose_formulation": "667 g/ha",
+        }],
+        "_guard_context": {"intent": "disease_pest", "script": "Latin"},
+    }
+
+    cleaned, changed = output_guards.scrub(answer, gathered)
+
+    assert changed
+    assert "Acephate 75% SP" in cleaned
+    assert "667 g/ha" in cleaned

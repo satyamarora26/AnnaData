@@ -1,4 +1,5 @@
 import importlib.util
+import sys
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -120,6 +121,31 @@ def test_unexpected_embedding_error_fails_the_run(tmp_path, monkeypatch):
 
     assert result.status == "failed"
     assert failures == [(17, "quota", result.parsed, 0, result.parsed)]
+
+
+def test_ingestion_deadline_rolls_back_without_activation(tmp_path, monkeypatch):
+    path = tmp_path / "guidance.txt"
+    path.write_text(_guidance_text(), encoding="utf-8")
+    failures = []
+    monkeypatch.setattr(ingestion.knowledge, "start_ingestion", lambda *args: "run-deadline")
+    monkeypatch.setattr(
+        ingestion.knowledge,
+        "embed",
+        lambda text: pytest.fail("deadline should prevent embedding"),
+    )
+    monkeypatch.setattr(ingestion.knowledge, "fail_ingestion", lambda *args: failures.append(args))
+    monkeypatch.setattr(
+        ingestion.knowledge,
+        "activate_documents",
+        lambda *args: pytest.fail("deadline must not activate staged documents"),
+    )
+
+    result = ingestion.ingest_source(_spec(), path, deadline_seconds=0)
+
+    assert result.status == "failed"
+    assert failures == [(
+        "run-deadline", "ingestion deadline exceeded", result.parsed, 0, result.parsed
+    )]
 
 
 def test_fetch_rejects_invalid_replacement_without_overwriting_local_file(tmp_path, monkeypatch):
@@ -292,12 +318,61 @@ def test_dry_run_does_not_initialize_the_database(tmp_path, monkeypatch):
             fetch=False,
             dry_run=True,
             manifest=Path("ignored.json"),
+            deadline_seconds=30,
         ),
     )
     monkeypatch.setattr(cli, "load_catalog", lambda path: {spec.id: spec})
     monkeypatch.setattr(cli.db, "init", lambda: pytest.fail("dry-run must not initialize the database"))
 
     assert cli.main() == 0
+
+
+def test_cli_has_a_positive_default_deadline(monkeypatch):
+    cli = _cli_module()
+    monkeypatch.setattr(sys, "argv", ["ingest_docs.py", "--source-id", "pm_kisan_guidelines"])
+
+    args = cli._parse_args()
+
+    assert args.deadline_seconds > 0
+
+
+def test_cli_shares_one_deadline_across_sources(monkeypatch):
+    cli = _cli_module()
+    first = _spec()
+    second = first.__class__(**{**first.__dict__, "id": "second_source"})
+    args = SimpleNamespace(
+        source_id=None,
+        all=True,
+        fetch=False,
+        dry_run=False,
+        manifest=Path("ignored.json"),
+        deadline_seconds=5,
+    )
+    deadlines = []
+
+    class Clock:
+        def __init__(self):
+            self.values = iter((100, 101, 102))
+
+        def monotonic(self):
+            return next(self.values)
+
+    monkeypatch.setattr(cli, "_parse_args", lambda: args)
+    monkeypatch.setattr(cli, "load_catalog", lambda path: {first.id: first, second.id: second})
+    monkeypatch.setattr(cli.db, "init", lambda: None)
+    monkeypatch.setattr(cli.db, "is_available", lambda: True)
+    monkeypatch.setattr(cli.db, "close", lambda: None)
+    monkeypatch.setattr(cli.knowledge, "init", lambda: True)
+    monkeypatch.setattr(cli, "time", Clock())
+    monkeypatch.setattr(
+        cli.ingestion,
+        "ingest_source",
+        lambda spec, path, dry_run, deadline_seconds: deadlines.append(deadline_seconds)
+        or ingestion.IngestResult(spec.id, "skipped", "hash", 1, 0, 0),
+    )
+
+    assert cli.main() == 0
+    assert deadlines == [4, 3]
 
 
 def test_cleanup_failure_still_records_the_fetch_audit(tmp_path, monkeypatch):

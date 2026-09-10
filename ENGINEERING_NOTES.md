@@ -878,6 +878,59 @@ its unit test passed, but browser submission of the two routes could not be
 observed because browser navigation was unavailable. These are acceptance gaps,
 not substituted sources or inferred results.
 
+### Task 8 fix round 1 (2026-09-10)
+
+The earlier verification gap was repaired with a bounded ingestion budget. The
+CLI now shares one monotonic `--deadline-seconds` budget across all selected
+sources (default 300 seconds), while `ingest_source` checks that budget before
+and after every embedding call. A deadline records a failed ingestion run and
+does not activate staged chunks, leaving the prior active corpus intact. Offline
+coverage for deadline rollback, aggregate budgeting, scheme attribution,
+fertiliser referral, registered-use enforcement, and evaluation latency passed:
+`./.venv/bin/python -m pytest tests/test_ingestion.py tests/test_output_guards.py
+tests/test_eval_run.py -q` reported **41 passed in 0.84s**. The complete backend
+suite then reported **107 passed in 1.01s**.
+
+The deterministic output guard now names the authority from the exact retained
+official passage when a scheme figure survives. For a Latin-script
+disease/pest answer with a matched CIB&RC record, it adds one registered product
+and only the dose facts from that same record. For an exact fertiliser quantity
+request without compatible retained evidence, it adds a soil-test and
+KVK/agriculture-officer referral without adding a quantity. The evaluation
+runner measures each `run_agent` call with `time.perf_counter` and prints its
+per-case latency plus mean and maximum over the cases run.
+
+The supplied 2026-27 MSP values were transcribed only into the ignored reviewed
+CSV after reading the supplied comprehensive PIB release and cross-checking its
+Kharif values against the supplied Kharif PIB release. The bounded live load
+reported 26 commodity rows and 42 aliases. The direct live check reported
+**25 distinct MSP labels**, and `msp.for_crop('wheat')` returned “Minimum
+Support Price for Wheat in 2026-27: Rs 2,585 per quintal.” The 25-label count
+is observed alias de-duplication, not an asserted 26-label invariant.
+
+Six already-present sources were attempted separately with
+`--deadline-seconds 90`, without any fetch. PM-KISAN reported `skipped; parsed=38
+stored=0 rejected=0`. Soil Health Card reported `completed; parsed=8 stored=8
+rejected=0`, and its immediate rerun reported the expected unchanged-hash skip.
+PMFBY, NHB, PAU Kharif, and PAU Rabi each returned after their bounded attempt
+with only “Database ready” and no final CLI status line; those four results and
+their idempotence remain unverified. The final direct live snapshot was **46
+active document chunks**, **2,456 pesticide uses**, and **25 MSP labels**.
+
+The former live failures were rerun once each with bounded outer alarms:
+`unsupported_fertilizer_quantity_is_removed` passed in **9.10s** and
+`dose_registered` passed in **6.80s**. Frontend `CI=true npm test --
+--watchAll=false` passed 1/1 without the prior React `act` warning, and
+`npm run build` compiled successfully with only the pre-existing outdated
+Browserslist notice. Fresh-port browser E2E remains unavailable: sandbox binds
+to ports 8011 and 3011 were denied, the one elevated retry for each exposed no
+listener, and bounded localhost curls were refused. This remains a tooling
+limitation, not a successful browser claim.
+
+The final pre-commit rerun reported **107 passed in 0.87s** for the complete
+backend suite; the frontend test again passed 1/1 in 0.718s without warnings,
+and the frontend build compiled successfully with the same Browserslist notice.
+
 ### Open-Meteo rate limits by IP, and the IP is shared
 
 Weather worked locally in 2s and failed in production. The cause was

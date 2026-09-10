@@ -121,8 +121,8 @@ cd AnnaData-Backend-main
 source .venv/bin/activate
 python -m pip install -r requirements-tools.txt
 python tools/ingest_docs.py --all --fetch --dry-run
-python tools/ingest_docs.py --all
-python tools/ingest_docs.py --all              # unchanged content should skip
+python tools/ingest_docs.py --all --deadline-seconds 300
+python tools/ingest_docs.py --all --deadline-seconds 300  # unchanged content should skip
 
 python tools/fetch_cibrc.py --out data/cibrc --timeout 60
 python tools/load_cibrc.py --dry-run
@@ -139,12 +139,43 @@ valid inherited artifacts during a recovery. Validate those files with
 instead. Browser-only sources must be saved from their exact manifest URL to
 the declared ignored path before the dry run.
 
+Every live ingestion invocation has an aggregate monotonic budget. The default
+is 300 seconds; use an explicit smaller value for a single source during a
+bounded verification, for example:
+
+```bash
+python tools/ingest_docs.py --source-id soil_health_card_faq --deadline-seconds 90
+```
+
+An expired budget fails the active ingestion audit and does not activate staged
+documents, preserving the prior active corpus.
+
 `GET /health` returns `status` plus an `integrations` object. Each configured
 provider exposes configured versus ready state; `database`, `earth_engine`, and
 `gemini` expose their initialization state; `knowledge` exposes provider,
 document and pesticide-use counts, and recent ingestion audits; `msp` exposes
 its readiness and commodity count. A configured-but-unready provider makes the
 top-level status `degraded`.
+
+### Task 8 verification status (2026-09-10)
+
+The official PIB MSP schedule was loaded from the reviewed local CSV with
+`tools/load_msp.py --year 2026-27` and the comprehensive PIB URL above. The
+live database reported 25 distinct MSP labels; `msp.for_crop('wheat')` returned
+2026-27 and Rs 2,585 per quintal.
+
+The bounded live document attempts confirmed PM-KISAN unchanged-hash skipping
+(`38` parsed) and Soil Health Card completion (`8` stored) followed by a skip.
+PMFBY, NHB, PAU Kharif, and PAU Rabi each ended after their bounded attempt
+without a final CLI status line, so they remain unverified rather than marked
+successful. The live snapshot contained 46 active document chunks and 2,456
+registered pesticide uses.
+
+The focused backend tests, full backend suite, frontend test, and frontend
+build passed. The two repaired live evaluation cases passed once each, with
+reported latencies of 9.10s and 6.80s. Fresh-port browser E2E remains
+unverified: sandbox port binding was denied, the one permitted retry exposed no
+listener on ports 8011 or 3011, and bounded localhost requests were refused.
 
 ---
 

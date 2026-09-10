@@ -84,6 +84,14 @@ ACTION_FALLBACK = (
     "Please contact your nearest Krishi Vigyan Kendra or agriculture officer "
     "for a verified recommendation."
 )
+FERTILIZER_REFERRAL = (
+    "Get a soil test and ask your nearest Krishi Vigyan Kendra or agriculture officer "
+    "for a field-specific recommendation."
+)
+_EXACT_FERTILIZER_REQUEST = re.compile(
+    r"\b(?:exact(?:ly)?|how\s+much|quantity|amount|application\s+rate|dose)\b",
+    re.I,
+)
 _ABBREVIATION_PERIOD = re.compile(r"\b(?:rs|mr|mrs|ms|dr|prof|sr|jr|no|etc)\.", re.I)
 _PROTECTED_PERIOD = "\u0000"
 
@@ -306,6 +314,54 @@ def _matched_dose_records(gathered: dict) -> list[tuple[str, set, set]]:
     return matched
 
 
+def _official_authorities_for_figures(gathered: dict, figures: set[str]) -> list[str]:
+    """Return authorities from official passages that support every stated figure."""
+    if not figures:
+        return []
+    authorities = []
+    for passage in gathered.get("_kb_passages") or []:
+        if not isinstance(passage, dict) or str(passage.get("tier") or "").casefold() != "official":
+            continue
+        content = passage.get("content")
+        authority = passage.get("authority")
+        if (
+            isinstance(content, str)
+            and isinstance(authority, str)
+            and authority.strip()
+            and figures.issubset(extract_financial_figures(content))
+        ):
+            authorities.append(authority.strip())
+    return list(dict.fromkeys(authorities))
+
+
+def _registered_use_line(gathered: dict) -> str | None:
+    context = gathered.get("_guard_context") or {}
+    if context.get("intent") != "disease_pest" or context.get("script") != "Latin":
+        return None
+    if _is_unmatched_dose_context(gathered.get("doses") or ""):
+        return None
+    for record in gathered.get("_dose_records") or []:
+        if not isinstance(record, dict):
+            continue
+        product = record.get("product")
+        if not isinstance(product, str) or not product.strip():
+            continue
+        details = [f"Registered CIB&RC use: {product.strip()}"]
+        pest = record.get("pest")
+        crop = record.get("crop")
+        if isinstance(pest, str) and pest.strip() and isinstance(crop, str) and crop.strip():
+            details.append(f"for {pest.strip()} on {crop.strip()}")
+        for key, label in (("dose_formulation", "dose"), ("dose_ai", "active ingredient dose"), ("dilution", "dilution")):
+            value = record.get(key)
+            if isinstance(value, str) and value.strip():
+                details.append(f"{label} {value.strip()}")
+        waiting = record.get("waiting_period")
+        if isinstance(waiting, int) and waiting >= 0:
+            details.append(f"wait {waiting} days before harvest")
+        return "; ".join(details) + "."
+    return None
+
+
 def _matches_dose_record(products: set[str], claims: set, periods: set[int], record: tuple) -> bool:
     product, record_claims, record_periods = record
     return (
@@ -377,8 +433,34 @@ def scrub(answer: str, gathered: dict) -> tuple[str, bool]:
             continue
         kept.append(sentence.strip())
 
+    cleaned = " ".join(kept).strip() if changed else answer
+    context = gathered.get("_guard_context") or {}
+
+    if (
+        context.get("intent") == "fertiliser_nutrition"
+        and _EXACT_FERTILIZER_REQUEST.search(str(context.get("query") or ""))
+        and not fertilizer_claims
+        and "soil test" not in cleaned.casefold()
+    ):
+        cleaned = f"{cleaned.rstrip()} {FERTILIZER_REFERRAL}".strip()
+        changed = True
+
+    scheme_authorities = []
+    for sentence in _sentences(cleaned):
+        if WELFARE_SCHEME.search(sentence):
+            scheme_authorities.extend(
+                _official_authorities_for_figures(gathered, extract_financial_figures(sentence))
+            )
+    for authority in dict.fromkeys(scheme_authorities):
+        if authority.casefold() not in cleaned.casefold():
+            cleaned = f"{cleaned.rstrip()} Source: {authority}.".strip()
+            changed = True
+
+    registered_use = _registered_use_line(gathered)
+    if registered_use and registered_use.split(":", 1)[1].split(";", 1)[0].strip().casefold() not in cleaned.casefold():
+        cleaned = f"{cleaned.rstrip()} {registered_use}".strip()
+        changed = True
+
     if not changed:
         return answer, False
-
-    cleaned = " ".join(kept).strip()
     return (cleaned or ACTION_FALLBACK), True

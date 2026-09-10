@@ -3,6 +3,7 @@ from dataclasses import dataclass
 import hashlib
 from pathlib import Path
 import re
+import time
 
 import knowledge
 from source_catalog import SourceSpec
@@ -137,7 +138,13 @@ def chunk_text(text: str) -> list[str]:
     return [chunk for chunk in chunks if len(chunk) >= MIN_CHUNK_CHARS]
 
 
-def ingest_source(spec: SourceSpec, path: Path, dry_run: bool = False) -> IngestResult:
+def ingest_source(
+    spec: SourceSpec,
+    path: Path,
+    dry_run: bool = False,
+    deadline_seconds: float | None = None,
+) -> IngestResult:
+    started_at = time.monotonic()
     validate_source_file(path)
     cleaned = clean_text(read_source(path))
     validate_extracted_text(spec, cleaned)
@@ -148,6 +155,8 @@ def ingest_source(spec: SourceSpec, path: Path, dry_run: bool = False) -> Ingest
     if dry_run:
         return IngestResult(spec.id, "dry-run", content_hash, len(chunks), 0, 0)
 
+    deadline_at = None if deadline_seconds is None else started_at + deadline_seconds
+
     run_id = knowledge.start_ingestion("document", spec.id, spec.source_url, content_hash)
     if run_id is None:
         return IngestResult(spec.id, "skipped", content_hash, len(chunks), 0, 0)
@@ -156,7 +165,21 @@ def ingest_source(spec: SourceSpec, path: Path, dry_run: bool = False) -> Ingest
     rejected = 0
     try:
         for index, text in enumerate(chunks):
+            if deadline_at is not None and time.monotonic() >= deadline_at:
+                knowledge.fail_ingestion(
+                    run_id, "ingestion deadline exceeded", len(chunks), stored, len(chunks) - stored
+                )
+                return IngestResult(
+                    spec.id, "failed", content_hash, len(chunks), stored, len(chunks) - stored
+                )
             vector = knowledge.embed(text)
+            if deadline_at is not None and time.monotonic() >= deadline_at:
+                knowledge.fail_ingestion(
+                    run_id, "ingestion deadline exceeded", len(chunks), stored, len(chunks) - stored
+                )
+                return IngestResult(
+                    spec.id, "failed", content_hash, len(chunks), stored, len(chunks) - stored
+                )
             if vector is None:
                 rejected += 1
                 continue

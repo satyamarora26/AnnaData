@@ -61,6 +61,15 @@ def check(name: str, condition: bool, detail: str = ""):
         raise Failure(f"{name}{': ' + detail if detail else ''}")
 
 
+def format_latency_summary(latencies: list[float]) -> str:
+    if not latencies:
+        return "latency: no case timings recorded"
+    return (
+        f"latency: mean={sum(latencies) / len(latencies):.2f}s, "
+        f"max={max(latencies):.2f}s across {len(latencies)} case(s)"
+    )
+
+
 def evaluate(case: dict, result) -> list[str]:
     """Return the list of assertion failures for one case."""
     expect = case.get("expect") or {}
@@ -183,11 +192,13 @@ def main() -> int:
 
     passed = failed = errored = 0
     failures = []
+    latencies = []
 
     for index, case in enumerate(cases):
         if index and args.delay:
             time.sleep(args.delay)
         profile = case.get("profile")
+        started = time.perf_counter()
         try:
             result = run_agent(
                 query=case["query"],
@@ -198,25 +209,31 @@ def main() -> int:
                 profile=profile,
             )
         except Exception as e:
+            elapsed = time.perf_counter() - started
+            latencies.append(elapsed)
             errored += 1
-            print(f"  ERROR  {case['id']}: {type(e).__name__}: {str(e)[:110]}")
+            print(f"  ERROR  {case['id']} ({elapsed:.2f}s): {type(e).__name__}: {str(e)[:110]}")
             continue
+
+        elapsed = time.perf_counter() - started
+        latencies.append(elapsed)
 
         problems = evaluate(case, result)
         if problems:
             failed += 1
-            print(f"  FAIL   {case['id']}")
+            print(f"  FAIL   {case['id']} ({elapsed:.2f}s)")
             for p in problems:
                 print(f"           - {p}")
             print(f"           answer: {result.answer[:150]}")
             failures.append(case["id"])
         else:
             passed += 1
-            print(f"  pass   {case['id']}")
+            print(f"  pass   {case['id']} ({elapsed:.2f}s)")
             if args.verbose:
                 print(f"           {result.answer[:150]}")
 
     print(f"\n{passed} passed, {failed} failed, {errored} errored")
+    print(format_latency_summary(latencies))
     if failures:
         print("failing: " + ", ".join(failures))
     db.close()

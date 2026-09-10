@@ -2,6 +2,7 @@
 import argparse
 from pathlib import Path
 import sys
+import time
 
 import requests
 
@@ -15,6 +16,7 @@ from source_catalog import SourceSpec, assert_trusted_url, load_catalog  # noqa:
 
 USER_AGENT = "AnnaData/1.0 (+https://github.com/satyamarora26/AnnaData)"
 GENERIC_CONTENT_TYPES = {"", "application/octet-stream"}
+DEFAULT_INGESTION_DEADLINE_SECONDS = 300
 
 
 def _content_type_is_allowed(spec: SourceSpec, content_type: str) -> bool:
@@ -87,12 +89,21 @@ def _parse_args() -> argparse.Namespace:
     selection.add_argument("--all", action="store_true", help="every manifest entry")
     parser.add_argument("--fetch", action="store_true", help="download entries whose fetch mode is http")
     parser.add_argument("--dry-run", action="store_true", help="parse and report without database writes")
+    parser.add_argument(
+        "--deadline-seconds",
+        type=float,
+        default=DEFAULT_INGESTION_DEADLINE_SECONDS,
+        help="per-source embedding deadline; defaults to %(default)s seconds",
+    )
     parser.add_argument("--manifest", type=Path, default=Path("data/source_manifest.json"), help="source manifest path")
     return parser.parse_args()
 
 
 def main() -> int:
     args = _parse_args()
+    if args.deadline_seconds <= 0:
+        print("--deadline-seconds must be positive", file=sys.stderr)
+        return 2
     catalog = load_catalog(args.manifest)
     if args.all:
         specs = list(catalog.values())
@@ -120,9 +131,20 @@ def main() -> int:
         knowledge.init()
 
     status = 0
+    deadline_at = time.monotonic() + args.deadline_seconds
     for spec in available:
+        remaining_seconds = deadline_at - time.monotonic()
+        if remaining_seconds <= 0:
+            print("ingestion deadline exceeded before remaining sources", file=sys.stderr)
+            status = 1
+            break
         try:
-            result = ingestion.ingest_source(spec, spec.local_path, args.dry_run)
+            result = ingestion.ingest_source(
+                spec,
+                spec.local_path,
+                args.dry_run,
+                deadline_seconds=remaining_seconds,
+            )
         except Exception as exc:
             print(f"ingestion failed for {spec.id}: {exc}", file=sys.stderr)
             status = 1

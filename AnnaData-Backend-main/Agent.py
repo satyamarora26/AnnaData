@@ -702,7 +702,13 @@ def run_agent(
     gathered = gather(tools, lat=lat, lon=lon, state=facts["state"], crop=facts["crop"],
                       query=query_final, intent=intent,
                       pest=_known(structured_input.get("pest")))
-    gathered["_guard_context"] = {"state": facts["state"], "crop": facts["crop"]}
+    gathered["_guard_context"] = {
+        "state": facts["state"],
+        "crop": facts["crop"],
+        "intent": intent,
+        "query": query,
+        "script": script_of(query),
+    }
 
     final_response = extract_markdown_content(
         get_farming_advice(facts["location"], facts["state"], facts["crop"],
