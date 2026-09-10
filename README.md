@@ -4,8 +4,9 @@ AI agricultural advisory for Indian farmers, reachable over the **web** and over
 
 Current verification and deployment boundaries: [API access](docs/API_ACCESS.md),
 [reproducible benchmarks](docs/BENCHMARKS.md), [browser checks](docs/BROWSER_TESTS.md),
-and [official source acquisition](docs/SOURCE_ACQUISITION.md). This is a verified
-local demo, not a claim of field validation or unrestricted production readiness.
+and [official source acquisition](docs/SOURCE_ACQUISITION.md). The [live demo](https://annadata-web.onrender.com)
+is deployed on Render's free tier; see [deployment verification](docs/RENDER_DEPLOYMENT.md).
+This is not a claim of field validation or unrestricted production readiness.
 SMS remains an opt-in integration and must not be publicly exposed until its
 webhook and scheduler ingress are authenticated.
 

@@ -38,9 +38,9 @@ official domain and parsed successfully; this is not a completed import.
   run is needed before claiming these sources are loaded.
 - eNAM's official PDF delivery remains invalid/unavailable. No certificate
   bypass, mirror or HTML-as-PDF substitution was accepted.
-- Render account registration is complete and a free backend configuration is
-  prepared, but no deployment has been submitted. Credential import requires
-  explicit approval to transfer the specified backend secrets to Render.
+- Render deployment completed after explicit credential-transfer approval.
+  The public frontend/backend passed desktop/mobile chat and CORS checks.
+  See `RENDER_DEPLOYMENT.md` for URLs, settings, evidence and free-tier limits.
 - SMS is excluded from the default Blueprint. Authenticating inbound webhooks
   and scheduler calls is required before deploying that optional channel.
 
