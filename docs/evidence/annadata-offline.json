@@ -1,0 +1,121 @@
+{
+  "schema_version": 1,
+  "mode": "offline_guard_ranking",
+  "status": "completed",
+  "started_at": "2026-09-10T11:35:35.208179+00:00",
+  "environment": {
+    "python": "3.12.14",
+    "platform": "macOS-26.6.2-arm64-arm-64bit"
+  },
+  "git": {
+    "commit": "96605979963d750d7758d7750d86fb10fa0f0180",
+    "dirty": true
+  },
+  "case_source": {
+    "path": "/Users/satyam/Documents/ChatGPT/CV/AnnaData/.worktrees/verified-ag-data/AnnaData-Backend-main/eval/benchmark.py",
+    "sha256": "65dc9637482d0175fa9320bfa3e564cbf447ccf7836821894bae89aa017125ca"
+  },
+  "timing_scope": "Synthetic in-process scrub/rank_passages wall time in seconds. Excludes imports, fixture copying, assertions and I/O. No LLM, embedding, vector search, database, network or HTTP/SMS transport; not live LLM latency. No warmup; fixed fixture order.",
+  "cases": [
+    {
+      "id": "guard_supported_fertilizer",
+      "category": "guard",
+      "iteration": 1,
+      "status": "passed",
+      "latency_seconds": 0.00019075005548074841,
+      "assertion_failures": [],
+      "error": null
+    },
+    {
+      "id": "guard_unsupported_fertilizer",
+      "category": "guard",
+      "iteration": 1,
+      "status": "passed",
+      "latency_seconds": 5.508301546797156e-05,
+      "assertion_failures": [],
+      "error": null
+    },
+    {
+      "id": "guard_reference_subsidy",
+      "category": "guard",
+      "iteration": 1,
+      "status": "passed",
+      "latency_seconds": 9.445799514651299e-05,
+      "assertion_failures": [],
+      "error": null
+    },
+    {
+      "id": "guard_preserves_observations",
+      "category": "guard",
+      "iteration": 1,
+      "status": "passed",
+      "latency_seconds": 5.4333999287337065e-05,
+      "assertion_failures": [],
+      "error": null
+    },
+    {
+      "id": "ranking_matching_scope",
+      "category": "ranking",
+      "iteration": 1,
+      "status": "passed",
+      "latency_seconds": 3.850000211969018e-05,
+      "assertion_failures": [],
+      "error": null
+    },
+    {
+      "id": "ranking_rejects_wrong_scope",
+      "category": "ranking",
+      "iteration": 1,
+      "status": "passed",
+      "latency_seconds": 5.874957423657179e-06,
+      "assertion_failures": [],
+      "error": null
+    },
+    {
+      "id": "ranking_rejects_low_similarity",
+      "category": "ranking",
+      "iteration": 1,
+      "status": "passed",
+      "latency_seconds": 1.3042008504271507e-05,
+      "assertion_failures": [],
+      "error": null
+    },
+    {
+      "id": "ranking_prefers_official",
+      "category": "ranking",
+      "iteration": 1,
+      "status": "passed",
+      "latency_seconds": 1.0791001841425896e-05,
+      "assertion_failures": [],
+      "error": null
+    }
+  ],
+  "run_error": null,
+  "unique_case_count": 8,
+  "iterations": 1,
+  "selected_count": 8,
+  "finished_at": "2026-09-10T11:35:35.265973+00:00",
+  "summary": {
+    "attempted": 8,
+    "passed": 8,
+    "failed": 0,
+    "errored": 0,
+    "pass_rate": 1.0,
+    "latency": {
+      "sample_count": 8,
+      "method": "nearest_rank",
+      "mean_seconds": 5.785412940895185e-05,
+      "p50_seconds": 3.850000211969018e-05,
+      "p95_seconds": 0.00019075005548074841,
+      "max_seconds": 0.00019075005548074841
+    },
+    "completed_latency": {
+      "sample_count": 8,
+      "method": "nearest_rank",
+      "mean_seconds": 5.785412940895185e-05,
+      "p50_seconds": 3.850000211969018e-05,
+      "p95_seconds": 0.00019075005548074841,
+      "max_seconds": 0.00019075005548074841
+    }
+  }
+}

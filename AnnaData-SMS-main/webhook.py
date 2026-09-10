@@ -47,7 +47,8 @@ def delete(webhook_id: str):
 
 
 def main():
-    problems = [p for p in config.validate() if "AI_ENDPOINT" not in p]
+    problems = [p for p in config.validate()
+                if "AI_ENDPOINT" not in p and "API_SERVICE_TOKEN" not in p]
     if problems:
         for p in problems:
             print(f"ERROR: {p}")

@@ -1,0 +1,125 @@
+name: Offline Checks
+
+on:
+  push:
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: offline-checks-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  backend:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    defaults:
+      run:
+        working-directory: AnnaData-Backend-main
+    env:
+      PYTHON_DOTENV_DISABLED: "1"
+      GEMINI_API_KEY: offline-test-key
+      GOOGLE_API_KEY: ""
+      DATABASE_URL: ""
+      EE_SERVICE_KEY: ""
+      GOV_API_KEY: ""
+      LOCATION_API_KEY: ""
+      KNOWLEDGE_BASE_ID: ""
+      AWS_ACCESS_KEY: ""
+      AWS_SECRET_KEY: ""
+      AWS_EC2_METADATA_DISABLED: "true"
+      FEEDBACK_EVAL_LIVE: "0"
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: pip
+          cache-dependency-path: |
+            AnnaData-Backend-main/requirements.txt
+            AnnaData-Backend-main/requirements-tools.txt
+            AnnaData-SMS-main/requirements.txt
+      - name: Install declared test dependencies
+        run: python -m pip install -r requirements-tools.txt -r ../AnnaData-SMS-main/requirements.txt
+      - name: Compile backend Python
+        run: python -m compileall -q -x '(^|/)(\.venv|__pycache__)/' .
+      - name: Backend tests with outbound connections blocked
+        run: |
+          python - <<'PY'
+          import socket
+          import pytest
+
+          def offline(*args, **kwargs):
+              raise AssertionError("Network access is forbidden in offline CI tests")
+
+          socket.socket.connect = offline
+          socket.socket.connect_ex = offline
+          socket.create_connection = offline
+          raise SystemExit(pytest.main(["tests", "-q", "--junitxml=test-results/backend.xml"]))
+          PY
+      - name: Synthetic guard and ranking benchmark
+        if: ${{ !cancelled() }}
+        run: python eval/benchmark.py --output test-results/offline-benchmark.json
+      - name: Publish benchmark summary
+        if: ${{ !cancelled() }}
+        run: |
+          python - <<'PY'
+          import json
+          import os
+          from pathlib import Path
+
+          report_path = Path("test-results/offline-benchmark.json")
+          if report_path.exists():
+              report = json.loads(report_path.read_text())
+              summary = report["summary"]
+              latency = summary["latency"]
+              with open(os.environ["GITHUB_STEP_SUMMARY"], "a") as output:
+                  output.write("## Offline Synthetic Guard/Ranking Checks\n\n")
+                  output.write("These are fixture regressions, not live LLM latency or production accuracy.\n\n")
+                  output.write(f"Run status: {report['status']}; {report['unique_case_count']} unique fixtures.\n\n")
+                  output.write(f"Passed: {summary['passed']}; failed: {summary['failed']}; errors: {summary['errored']}.\n\n")
+                  output.write(f"Nearest-rank seconds: p50={latency['p50_seconds']}, p95={latency['p95_seconds']}; n={latency['sample_count']}.\n")
+          PY
+      - name: Retain backend results
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: backend-results
+          path: AnnaData-Backend-main/test-results/
+          if-no-files-found: warn
+          retention-days: 14
+
+  frontend:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    defaults:
+      run:
+        working-directory: AnnaData-Frontend-main
+    env:
+      CI: "true"
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+          cache: npm
+          cache-dependency-path: AnnaData-Frontend-main/package-lock.json
+      - name: Install locked frontend dependencies
+        run: npm ci --no-audit --no-fund
+      - name: Frontend tests
+        run: |
+          mkdir -p test-results
+          npm test -- --watchAll=false --runInBand --json --outputFile=test-results/frontend.json
+      - name: Production build
+        run: npm run build
+      - name: Retain frontend results
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: frontend-results
+          path: AnnaData-Frontend-main/test-results/
+          if-no-files-found: warn
+          retention-days: 14

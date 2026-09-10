@@ -1,12 +1,12 @@
-# Render Blueprint — deploys all three AnnaData services from this one repo.
+# Render Blueprint — public demo: backend and frontend only.
 #
 # Render reads this file automatically when you create a Blueprint from the
 # repo. Values marked `sync: false` are NOT stored here; Render prompts for them
-# at deploy time, which is how the API key and gateway password stay out of Git.
+# at deploy time, which is how the API key stays out of Git.
 #
-# Free instances sleep after ~15 minutes idle and take ~50s to wake. See the
-# "Keeping the services warm" section of README.md before pointing real farmers
-# at the SMS number.
+# SMS is explicit manual opt-in AFTER webhook and scheduler authentication has
+# been implemented and verified. See docs/API_ACCESS.md. Never provision the
+# service token for this public-only deployment.
 
 services:
   # ----------------------------------------------------------------- backend
@@ -17,7 +17,9 @@ services:
     region: singapore          # closest Render region to India
     rootDir: AnnaData-Backend-main
     buildCommand: pip install -r requirements.txt
-    startCommand: uvicorn app:app --host 0.0.0.0 --port $PORT
+    # Limits are process-local. Keep one worker AND one instance; see docs/API_ACCESS.md.
+    # Proxy headers stay disabled until the ingress trust boundary is configured.
+    startCommand: uvicorn app:app --host 0.0.0.0 --port $PORT --workers 1 --no-proxy-headers
     healthCheckPath: /health
     envVars:
       - key: PYTHON_VERSION
@@ -27,9 +29,28 @@ services:
       # Farmer queries and answers are frequently Devanagari/Gurmukhi.
       - key: PYTHONIOENCODING
         value: "utf-8"
-      # The only required secret. Render will prompt for it.
+      # Required for public chat. Render will prompt for it.
       - key: GEMINI_API_KEY
         sync: false
+      # API_SERVICE_TOKEN is intentionally unset: privileged requests fail closed.
+      - key: API_RATE_WINDOW_SECONDS
+        value: "60"
+      - key: API_RATE_PER_CLIENT
+        value: "12"
+      - key: API_RATE_GLOBAL
+        value: "120"
+      - key: API_RATE_MAX_CLIENTS
+        value: "2048"
+      - key: API_MAX_CONCURRENT_REQUESTS
+        value: "4"
+      - key: API_BODY_READ_TIMEOUT_SECONDS
+        value: "15"
+      - key: API_MAX_REQUEST_BYTES
+        value: "65536"
+      - key: API_MAX_UPLOAD_BYTES
+        value: "5242880"
+      - key: API_MAX_MEDIA_REQUEST_BYTES
+        value: "11534336"
       # Fastest model first; later entries are fallbacks on 429/503/404.
       - key: TEXT_MODELS
         value: gemini-3.1-flash-lite,gemini-3.6-flash,gemini-3.5-flash-lite
@@ -54,48 +75,6 @@ services:
         sync: false
       - key: AWS_SECRET_KEY
         sync: false
-
-  # --------------------------------------------------------------- SMS bridge
-  - type: web
-    name: annadata-sms
-    runtime: python
-    plan: free
-    region: singapore
-    rootDir: AnnaData-SMS-main
-    buildCommand: pip install -r requirements.txt
-    startCommand: uvicorn app:app --host 0.0.0.0 --port $PORT
-    healthCheckPath: /health
-    envVars:
-      - key: PYTHON_VERSION
-        value: "3.12.7"
-      - key: PYTHONUNBUFFERED
-        value: "1"
-      - key: PYTHONIOENCODING
-        value: "utf-8"
-      - key: SMS_MODE
-        value: cloud
-      # From the Android app's "Cloud Server" section.
-      - key: APP_USERNAME
-        sync: false
-      - key: PASSWORD
-        sync: false
-      # Set these by hand after the first deploy, to the PUBLIC URLs shown at
-      # the top of each service's Render page.
-      #
-      # Do NOT use `fromService ... property: host` here: that resolves to
-      # Render's *internal* hostname (bare service name, no .onrender.com),
-      # which is not reachable as a public URL. Render also appends a random
-      # suffix when a service name is taken, so the public host is often not
-      # the name in this file.
-      #
-      #   AI_ENDPOINT = https://<backend-host>.onrender.com/agent
-      - key: AI_ENDPOINT
-        sync: false
-      #   PUBLIC_URL  = https://<this-service-host>.onrender.com
-      - key: PUBLIC_URL
-        sync: false
-      - key: MAX_SMS_SEGMENTS
-        value: "4"
 
   # ----------------------------------------------------------------- frontend
   - type: web

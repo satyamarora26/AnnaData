@@ -43,6 +43,7 @@ def whatsapp_enabled() -> bool:
 
 
 _AI_ENDPOINT_RAW = _get("AI_ENDPOINT")     # e.g. https://api.example.com/agent
+API_SERVICE_TOKEN = _get("API_SERVICE_TOKEN")
 PUBLIC_URL = _get("PUBLIC_URL") or _get("NGROK_URL")  # where this bridge is reachable
 
 
@@ -63,6 +64,14 @@ def _normalise_endpoint(value: str | None) -> str | None:
 
 
 AI_ENDPOINT = _normalise_endpoint(_AI_ENDPOINT_RAW)
+
+
+def backend_headers() -> dict[str, str]:
+    """Per-request headers, never defaults on the session shared with providers."""
+    if not API_SERVICE_TOKEN:
+        raise RuntimeError("API_SERVICE_TOKEN is not configured")
+    return {"Authorization": f"Bearer {API_SERVICE_TOKEN}",
+            "accept": "application/json", "Content-Type": "application/json"}
 
 
 # Asking for a rating costs a real SMS from the farmer's own SIM, so it is
@@ -130,6 +139,10 @@ STOP_REPLY = _get(
     "STOP_REPLY",
     "Your saved details have been deleted. Message us any time to start again.",
 )
+STOP_FAILURE_REPLY = _get(
+    "STOP_FAILURE_REPLY",
+    "AnnaData could not delete your saved details right now. Please try STOP again shortly.",
+)
 
 
 def public_url() -> str | None:
@@ -171,6 +184,8 @@ def validate() -> list[str]:
         problems.append("APP_USERNAME / PASSWORD not set (gateway credentials)")
     if not AI_ENDPOINT:
         problems.append("AI_ENDPOINT not set (backend /agent URL)")
+    if not API_SERVICE_TOKEN:
+        problems.append("API_SERVICE_TOKEN not set (backend service authorization)")
     try:
         base_url()
     except RuntimeError as e:

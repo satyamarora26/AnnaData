@@ -174,6 +174,41 @@ def embed(text: str, dim: int = EMBED_DIM, timeout_seconds: float = 60) -> list[
         return None
 
 
+def _batch_retry_delay(error: urllib.error.HTTPError) -> float | None:
+    """Use only a positive finite delay supplied by the provider."""
+    retry_after = error.headers.get("Retry-After") if error.headers else None
+    try:
+        delay = float(retry_after)
+        if math.isfinite(delay) and delay > 0:
+            return delay
+    except (TypeError, ValueError):
+        pass
+
+    try:
+        raw = error.read(65537)
+        if len(raw) > 65536:
+            return None
+        payload = json.loads(raw)
+        info = payload.get("error") if isinstance(payload, dict) else None
+        details = info.get("details") if isinstance(info, dict) else None
+        if not isinstance(details, list):
+            return None
+        for detail in details:
+            if (not isinstance(detail, dict)
+                    or detail.get("@type") != "type.googleapis.com/google.rpc.RetryInfo"):
+                continue
+            duration = detail.get("retryDelay")
+            if not isinstance(duration, str) or not re.fullmatch(r"[0-9]+(?:\.[0-9]{1,9})?s", duration):
+                continue
+            delay = float(duration[:-1])
+            if math.isfinite(delay) and delay > 0:
+                return delay
+    except Exception:
+        # Unreadable or malformed provider metadata must not escape or be logged.
+        return None
+    return None
+
+
 def embed_batch(
     texts: list[str], dim: int = EMBED_DIM, timeout_seconds: float = 60,
     sleep=time.sleep,
@@ -212,19 +247,15 @@ def embed_batch(
                 raise ValueError("batch embedding response had an unexpected dimension")
             return values
         except urllib.error.HTTPError as exc:
-            retry_after = exc.headers.get("Retry-After") if exc.headers else None
-            try:
-                delay = float(retry_after) if retry_after is not None else 0
-            except ValueError:
-                delay = 0
+            with exc:
+                delay = _batch_retry_delay(exc) if exc.code == 429 and not attempt else None
             remaining = timeout_seconds - (time.monotonic() - started_at)
-            if (exc.code != 429 or attempt or not math.isfinite(delay)
-                    or delay <= 0 or delay >= remaining):
-                print(f"Batch embedding failed: HTTP Error {exc.code}: {exc.reason}")
+            if delay is None or delay >= remaining:
+                print(f"Batch embedding failed: HTTP {exc.code}")
                 return None
             sleep(delay)
-        except Exception as exc:
-            print(f"Batch embedding failed: {exc}")
+        except Exception:
+            print("Batch embedding failed: invalid response or transport error")
             return None
     return None
 
@@ -566,6 +597,62 @@ def stage_document(run_id: int, spec: SourceSpec, content_hash: str,
     except Exception as exc:
         print(f"Could not stage document: {exc}")
         return False
+
+
+def stage_documents(run_id: int, spec: SourceSpec, content_hash: str,
+                    contents: list[str], start_index: int,
+                    embeddings: list[list[float]], *, deadline_at: float,
+                    clock=time.monotonic) -> int:
+    """Stage one bounded embedding batch in a single inactive transaction."""
+    from psycopg import sql
+
+    if not math.isfinite(deadline_at):
+        raise ValueError("staging requires a finite deadline")
+    if not contents or len(contents) != len(embeddings) or len(contents) > 100:
+        raise ValueError("staging requires 1-100 matching chunks and embeddings")
+
+    def remaining_ms():
+        value = int((deadline_at - clock()) * 1000)
+        if value < 1:
+            raise TimeoutError("ingestion deadline exceeded")
+        return value
+
+    rows = []
+    for index, (content, vector) in enumerate(zip(contents, embeddings), start=start_index):
+        rows.extend((spec.id, spec.title, spec.source_url, spec.authority, spec.tier,
+                     spec.published_on, json.dumps(asdict(spec)["scope"]),
+                     list(spec.topics), content_hash, run_id, index, content, str(vector)))
+    values = sql.SQL(
+        "(%s,%s,%s,%s,%s,%s,%s::jsonb,%s,%s,%s,FALSE,%s,%s,%s::vector)"
+    )
+    statement = sql.SQL("""INSERT INTO documents
+        (source,title,url,authority,tier,published_on,scope,topics,content_hash,
+         ingestion_run_id,active,chunk_index,content,embedding) VALUES {}
+    """).format(sql.SQL(",").join([values] * len(contents)))
+    try:
+        with db.connection() as conn:
+            def bounded_execute(query, params=()):
+                conn.execute("SELECT set_config('statement_timeout', %s, true)",
+                             (f"{remaining_ms()}ms",))
+                return conn.execute(query, params)
+
+            lease = bounded_execute(
+                """UPDATE ingestion_runs SET heartbeat_at=now()
+                   WHERE id=%s AND source=%s AND content_hash=%s AND status='running'
+                   RETURNING id""", (run_id, spec.id, content_hash)
+            ).fetchone()
+            if lease is None:
+                raise IngestionLeaseActive("ingestion lease is no longer active")
+            bounded_execute(statement, tuple(rows))
+            conn.execute("SELECT set_config('statement_timeout', %s, true)",
+                         (f"{remaining_ms()}ms",))
+            remaining_ms()
+            conn.commit()
+        return len(contents)
+    except Exception as exc:
+        if getattr(exc, "sqlstate", None) in ACTIVATION_TIMEOUT_SQLSTATES:
+            raise TimeoutError("ingestion deadline exceeded") from exc
+        raise
 
 
 def activate_documents(run_id: int, spec: SourceSpec, content_hash: str,

@@ -18,6 +18,8 @@ TRUSTED_HOSTS = {
     "enam.gov.in",
     "icar.gov.in",
     "www.icar.gov.in",
+    "icar.org.in",
+    "www.icar.org.in",
     "nhb.gov.in",
     "www.nhb.gov.in",
     "pau.edu",

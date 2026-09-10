@@ -12,26 +12,29 @@ against before it reaches anyone.
     python eval/run.py --tag safety        # one group
     python eval/run.py --tag fast --limit 5
     python eval/run.py --id dose_refused_when_unregistered
+    python eval/run.py --tag safety --output /tmp/live-eval.json
 
 Each case costs two model calls, so the whole suite does not fit inside the
 free tier's daily quota. Tags exist so a change can be checked against the
 cases it might plausibly have broken.
 """
 import argparse
+import hashlib
+import json
+import math
+import platform
 import re
+import subprocess
 import sys
 import time
+from datetime import datetime, timezone
 from pathlib import Path
 
 import yaml
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
-import db  # noqa: E402
-import startup  # noqa: E402
-from Agent import run_agent, script_of  # noqa: E402
-
-sys.path.insert(0, str(Path(__file__).resolve().parent.parent.parent / "AnnaData-SMS-main"))
+sys.path.append(str(Path(__file__).resolve().parent.parent.parent / "AnnaData-SMS-main"))
 try:
     from sms_text import segment_count, to_plain_text
 except ImportError:  # the bridge is a separate service; degrade rather than fail
@@ -61,13 +64,74 @@ def check(name: str, condition: bool, detail: str = ""):
         raise Failure(f"{name}{': ' + detail if detail else ''}")
 
 
+def latency_summary(latencies: list[float]) -> dict:
+    """Nearest-rank percentiles; no samples means null, never a measured zero."""
+    ordered = sorted(latencies)
+    count = len(ordered)
+    return {
+        "sample_count": count,
+        "method": "nearest_rank",
+        "mean_seconds": sum(ordered) / count if count else None,
+        "p50_seconds": ordered[math.ceil(0.50 * count) - 1] if count else None,
+        "p95_seconds": ordered[math.ceil(0.95 * count) - 1] if count else None,
+        "max_seconds": ordered[-1] if count else None,
+    }
+
+
 def format_latency_summary(latencies: list[float]) -> str:
     if not latencies:
         return "latency: no case timings recorded"
+    summary = latency_summary(latencies)
     return (
-        f"latency: mean={sum(latencies) / len(latencies):.2f}s, "
-        f"max={max(latencies):.2f}s across {len(latencies)} case(s)"
+        f"latency: mean={summary['mean_seconds']:.2f}s, "
+        f"p50={summary['p50_seconds']:.2f}s, p95={summary['p95_seconds']:.2f}s, "
+        f"max={summary['max_seconds']:.2f}s across {len(latencies)} case(s)"
     )
+
+
+def new_report(mode: str, source: Path, timing_scope: str) -> dict:
+    try:
+        commit = subprocess.check_output(
+            ["git", "rev-parse", "HEAD"], cwd=Path(__file__).parent,
+            text=True, stderr=subprocess.DEVNULL,
+        ).strip()
+        dirty = bool(subprocess.check_output(
+            ["git", "status", "--porcelain"], cwd=Path(__file__).parent,
+            text=True, stderr=subprocess.DEVNULL,
+        ).strip())
+    except (OSError, subprocess.CalledProcessError):
+        commit, dirty = None, None
+    return {
+        "schema_version": 1,
+        "mode": mode,
+        "status": "incomplete",
+        "started_at": datetime.now(timezone.utc).isoformat(),
+        "environment": {"python": platform.python_version(), "platform": platform.platform()},
+        "git": {"commit": commit, "dirty": dirty},
+        "case_source": {"path": str(source), "sha256": hashlib.sha256(source.read_bytes()).hexdigest()},
+        "timing_scope": timing_scope,
+        "cases": [],
+        "run_error": None,
+    }
+
+
+def save_report(report: dict, output: Path) -> None:
+    records = report["cases"]
+    passed = sum(r["status"] == "passed" for r in records)
+    report["finished_at"] = datetime.now(timezone.utc).isoformat()
+    report["summary"] = {
+        "attempted": len(records),
+        "passed": passed,
+        "failed": sum(r["status"] == "failed" for r in records),
+        "errored": sum(r["status"] == "error" for r in records),
+        "pass_rate": passed / len(records) if records else None,
+        "latency": latency_summary([r["latency_seconds"] for r in records]),
+        "completed_latency": latency_summary([
+            r["latency_seconds"] for r in records if r["status"] in {"passed", "failed"}
+        ]),
+    }
+    output.parent.mkdir(parents=True, exist_ok=True)
+    output.write_text(json.dumps(report, indent=2, ensure_ascii=False, allow_nan=False) + "\n", encoding="utf-8")
 
 
 def evaluate(case: dict, result) -> list[str]:
@@ -81,6 +145,8 @@ def evaluate(case: dict, result) -> list[str]:
         problems.append(msg)
 
     if "script" in expect:
+        from Agent import script_of
+
         got = script_of(answer)
         if got != expect["script"]:
             fail(f"script: expected {expect['script']}, got {got}")
@@ -163,7 +229,7 @@ def evaluate(case: dict, result) -> list[str]:
     return problems
 
 
-def main() -> int:
+def main(argv=None) -> int:
     ap = argparse.ArgumentParser()
     ap.add_argument("--tag", help="only cases carrying this tag")
     ap.add_argument("--id", help="only this case")
@@ -171,73 +237,102 @@ def main() -> int:
     ap.add_argument("--delay", type=float, default=0,
                     help="seconds to sleep between live cases")
     ap.add_argument("--verbose", action="store_true", help="print every answer")
-    args = ap.parse_args()
+    ap.add_argument("--output", type=Path, default=Path("eval/results.json"),
+                    help="JSON report path (overwritten; default: eval/results.json)")
+    args = ap.parse_args(argv)
+    if args.limit is not None and args.limit < 1:
+        ap.error("--limit must be at least 1")
+    if not math.isfinite(args.delay) or args.delay < 0:
+        ap.error("--delay must be finite and nonnegative")
 
-    cases = yaml.safe_load(CASES.read_text(encoding="utf-8"))
+    cases = yaml.safe_load(CASES.read_text(encoding="utf-8")) or []
     if args.tag:
         cases = [c for c in cases if args.tag in (c.get("tags") or [])]
     if args.id:
         cases = [c for c in cases if c["id"] == args.id]
-    if args.limit:
+    if args.limit is not None:
         cases = cases[: args.limit]
 
+    report = new_report(
+        "live_agent", CASES,
+        "run_agent wall time in seconds, including tools/retries; excludes startup, delay, "
+        "assertions and report I/O. Not isolated LLM or deployed HTTP/SMS latency.",
+    )
+    report["selection"] = {"tag": args.tag, "id": args.id, "limit": args.limit, "delay_seconds": args.delay}
+    report["selected_count"] = len(cases)
     if not cases:
+        report["status"] = "no_cases"
+        save_report(report, args.output)
         print("No cases matched.")
         return 1
 
-    db.init()
-    startup.init_earth_engine()
+    database = None
+    try:
+        # Loading reporting helpers or --help must not construct model clients.
+        import db
+        import startup
+        from Agent import run_agent
+        from config import TEXT_MODELS
 
-    print(f"Running {len(cases)} case(s)  (~{len(cases) * 2} model calls)\n")
-
-    passed = failed = errored = 0
-    failures = []
-    latencies = []
-
-    for index, case in enumerate(cases):
-        if index and args.delay:
-            time.sleep(args.delay)
-        profile = case.get("profile")
-        started = time.perf_counter()
+        database = db
+        report["configured_models"] = list(TEXT_MODELS)
+        db.init()
+        startup.init_earth_engine()
+        print(f"Running {len(cases)} live case(s); model call count is not measured.\n")
+        for index, case in enumerate(cases):
+            if index and args.delay:
+                time.sleep(args.delay)
+            profile = case.get("profile")
+            record = {"id": case["id"], "tags": case.get("tags") or [],
+                      "status": "error", "assertion_failures": [], "error": None}
+            phase = "agent"
+            started = time.perf_counter()
+            try:
+                result = run_agent(
+                    query=case["query"],
+                    latitude=(profile or {}).get("latitude"),
+                    longitude=(profile or {}).get("longitude"),
+                    history=case.get("history"),
+                    channel=case.get("channel", "sms"),
+                    profile=profile,
+                )
+                record["latency_seconds"] = time.perf_counter() - started
+                phase = "assertions"
+                record["assertion_failures"] = evaluate(case, result)
+                record["status"] = "failed" if record["assertion_failures"] else "passed"
+                if args.verbose or record["status"] == "failed":
+                    print(f"           answer: {(result.answer or '')[:150]}")
+            except Exception as error:
+                if phase == "agent":
+                    record["latency_seconds"] = time.perf_counter() - started
+                record["error"] = {"type": type(error).__name__, "message": str(error), "phase": phase}
+            report["cases"].append(record)
+            print(f"  {record['status']:6} {case['id']} ({record['latency_seconds']:.2f}s)")
+            for problem in record["assertion_failures"]:
+                print(f"           - {problem}")
+            if record["error"]:
+                print(f"           {record['error']['type']}: {record['error']['message'][:110]}")
+        report["status"] = "completed"
+    except KeyboardInterrupt:
+        report["status"] = "interrupted"
+    except Exception as error:
+        report["status"] = "error"
+        report["run_error"] = {"type": type(error).__name__, "message": str(error)}
+        print(f"Run error: {type(error).__name__}: {error}")
+    finally:
         try:
-            result = run_agent(
-                query=case["query"],
-                latitude=(profile or {}).get("latitude"),
-                longitude=(profile or {}).get("longitude"),
-                history=case.get("history"),
-                channel=case.get("channel", "sms"),
-                profile=profile,
-            )
-        except Exception as e:
-            elapsed = time.perf_counter() - started
-            latencies.append(elapsed)
-            errored += 1
-            print(f"  ERROR  {case['id']} ({elapsed:.2f}s): {type(e).__name__}: {str(e)[:110]}")
-            continue
+            if database is not None:
+                database.close()
+        finally:
+            save_report(report, args.output)
 
-        elapsed = time.perf_counter() - started
-        latencies.append(elapsed)
-
-        problems = evaluate(case, result)
-        if problems:
-            failed += 1
-            print(f"  FAIL   {case['id']} ({elapsed:.2f}s)")
-            for p in problems:
-                print(f"           - {p}")
-            print(f"           answer: {result.answer[:150]}")
-            failures.append(case["id"])
-        else:
-            passed += 1
-            print(f"  pass   {case['id']} ({elapsed:.2f}s)")
-            if args.verbose:
-                print(f"           {result.answer[:150]}")
-
-    print(f"\n{passed} passed, {failed} failed, {errored} errored")
-    print(format_latency_summary(latencies))
-    if failures:
-        print("failing: " + ", ".join(failures))
-    db.close()
-    return 0 if not (failed or errored) else 1
+    summary = report["summary"]
+    print(f"\n{summary['passed']} passed, {summary['failed']} failed, {summary['errored']} errored")
+    print(format_latency_summary([r["latency_seconds"] for r in report["cases"]]))
+    print(f"JSON report: {args.output}")
+    if report["status"] == "interrupted":
+        return 130
+    return 0 if report["status"] == "completed" and not (summary["failed"] or summary["errored"]) else 1
 
 
 if __name__ == "__main__":

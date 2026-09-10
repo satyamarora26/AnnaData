@@ -1,0 +1,41 @@
+{
+  "timestamp": "2026-09-10T11:19:48.729Z",
+  "results": [
+    {
+      "viewport": {
+        "width": 1440,
+        "height": 900
+      },
+      "mode": "mocked backend",
+      "answerReceived": true,
+      "elapsedMs": 580
+    },
+    {
+      "viewport": {
+        "width": 1440,
+        "height": 900
+      },
+      "mode": "mocked backend",
+      "rateLimitErrorVisible": true,
+      "composerRecovered": true
+    },
+    {
+      "viewport": {
+        "width": 390,
+        "height": 844
+      },
+      "mode": "mocked backend",
+      "answerReceived": true,
+      "elapsedMs": 49
+    },
+    {
+      "viewport": {
+        "width": 390,
+        "height": 844
+      },
+      "mode": "mocked backend",
+      "rateLimitErrorVisible": true,
+      "composerRecovered": true
+    }
+  ]
+}

@@ -3,7 +3,8 @@ import encoding_setup  # noqa: F401  (must be first)
 from contextlib import asynccontextmanager
 from typing import List, Optional
 
-from fastapi import FastAPI, UploadFile, File, HTTPException
+from fastapi import FastAPI, UploadFile, File, HTTPException, Request
+from fastapi.exceptions import RequestValidationError
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
 from pydantic import BaseModel
@@ -18,6 +19,7 @@ import readiness
 import startup
 from Agent import run_agent
 from process_media import process_media
+from api_security import APISecurityMiddleware, require_service_token
 
 @asynccontextmanager
 async def lifespan(_app: FastAPI):
@@ -46,6 +48,8 @@ def _build_origins() -> list[str]:
     return sorted(set(origins))
 
 
+# CORS is outermost so security failures remain readable by the public UI.
+app.add_middleware(APISecurityMiddleware)
 app.add_middleware(
     CORSMiddleware,
     allow_origins=_build_origins(),
@@ -53,6 +57,12 @@ app.add_middleware(
     allow_methods=["*"],
     allow_headers=["*"],
 )
+
+
+@app.exception_handler(RequestValidationError)
+async def invalid_request(_request: Request, _exc: RequestValidationError):
+    # FastAPI's default validation errors echo input, including farmer data.
+    return JSONResponse({"detail": "Invalid request"}, status_code=422)
 
 
 def on_startup():
@@ -118,12 +128,14 @@ def health():
 
 
 @app.post("/agent")
-def run_agent_endpoint(request: QueryRequest):
+def run_agent_endpoint(request: QueryRequest, http_request: Request):
+    channel = (request.channel or "web").strip().lower()
+    if request.user_id is not None or channel == "sms":
+        require_service_token(http_request)
     if not request.query or not request.query.strip():
         raise HTTPException(status_code=400, detail="query must not be empty")
 
     user_id = (request.user_id or "").strip() or None
-    channel = request.channel or "web"
 
     profile = profile_store.get_profile(user_id) if user_id else None
 
@@ -158,8 +170,8 @@ def run_agent_endpoint(request: QueryRequest):
     except Exception as e:
         # Previously this returned 200 with an {"error": ...} body, so callers
         # (the SMS bridge especially) treated failures as successful replies.
-        print(f"Error in agent function: {e}")
-        raise HTTPException(status_code=502, detail=f"Agent failed: {e}")
+        print(f"Error in agent function: {type(e).__name__}")
+        raise HTTPException(status_code=502, detail="Agent is temporarily unavailable") from None
 
     needs_location = False
     if user_id:
@@ -269,8 +281,16 @@ async def chat_describe(
     audio: Optional[UploadFile] = File(None, description="Optional audio file"),
     image: Optional[UploadFile] = File(None, description="Optional image file"),
 ):
-    audio_bytes = await audio.read() if audio is not None else None
-    image_bytes = await image.read() if image is not None else None
+    async def read_upload(upload):
+        if upload is None:
+            return None
+        data = await upload.read(config.API_MAX_UPLOAD_BYTES + 1)
+        if len(data) > config.API_MAX_UPLOAD_BYTES:
+            raise HTTPException(status_code=413, detail="Uploaded file is too large")
+        return data
+
+    audio_bytes = await read_upload(audio)
+    image_bytes = await read_upload(image)
 
     if not audio_bytes and not image_bytes:
         return JSONResponse(content={"error": "No file provided"}, status_code=400)
@@ -300,7 +320,7 @@ async def chat_describe(
             extra_prompt=prompt_text,
         )
     except Exception as e:
-        print(f"Media processing failed: {e}")
-        raise HTTPException(status_code=502, detail=f"Media processing failed: {e}")
+        print(f"Media processing failed: {type(e).__name__}")
+        raise HTTPException(status_code=502, detail="Media processing is temporarily unavailable") from None
 
     return JSONResponse(content={"Result": (output or "").strip()})

@@ -39,6 +39,12 @@ def test_unlisted_host_is_rejected():
         assert_trusted_url("https://example.com/fertilizer-advice.pdf")
 
 
+def test_current_icar_official_domain_is_trusted():
+    assert_trusted_url("https://icar.org.in/sites/default/files/report.pdf")
+    with pytest.raises(ValueError, match="untrusted source host"):
+        assert_trusted_url("https://icar.org.in.example.com/report.pdf")
+
+
 def test_absolute_local_path_is_rejected(tmp_path):
     manifest = _manifest_with(tmp_path, local_path="/tmp/replaced.pdf")
 

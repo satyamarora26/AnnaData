@@ -1,4 +1,6 @@
 from contextlib import nullcontext
+from io import BytesIO
+import json
 from pathlib import Path
 
 import knowledge
@@ -730,3 +732,114 @@ def test_batch_embed_rejects_nonfinite_retry_after(monkeypatch):
 
     assert len(calls) == 1
     assert sleeps == []
+
+
+def _retry_info(delay):
+    return {"error": {"message": "private-provider-message", "details": [
+        {"@type": "type.googleapis.com/google.rpc.RetryInfo", "retryDelay": delay},
+    ]}}
+
+
+@pytest.mark.parametrize("headers,delay", [
+    ({}, 0.25), ({"Retry-After": "invalid"}, 0.25),
+    ({"Retry-After": "nan"}, 0.25), ({"Retry-After": "0.125"}, 0.125),
+])
+def test_batch_embed_retries_json_delay_with_remaining_timeout(monkeypatch, headers, delay):
+    now = [0.0]
+    calls, sleeps, errors = [], [], []
+
+    def urlopen(request, timeout):
+        calls.append(timeout)
+        if len(calls) == 1:
+            now[0] += 0.1
+            error = knowledge.urllib.error.HTTPError(
+                request.full_url, 429, "private-provider-message", headers,
+                BytesIO(json.dumps(_retry_info("0.25s")).encode()),
+            )
+            errors.append(error)
+            raise error
+        return BytesIO(b'{"embeddings": [{"values": [0.1, 0.2]}]}')
+
+    def sleep(seconds):
+        sleeps.append(seconds)
+        now[0] += seconds
+
+    monkeypatch.setattr(knowledge, "GEMINI_API_KEY", "test-key")
+    monkeypatch.setattr(knowledge.time, "monotonic", lambda: now[0])
+    monkeypatch.setattr(knowledge.urllib.request, "urlopen", urlopen)
+
+    assert knowledge.embed_batch(["first"], dim=2, timeout_seconds=1, sleep=sleep) == [[0.1, 0.2]]
+    assert sleeps == [delay]
+    assert calls == pytest.approx([1, 0.9 - delay])
+    assert errors[0].closed
+
+
+@pytest.mark.parametrize("payload", [
+    b"not json private-provider-message", b"[]", b'{"error": []}',
+    {"error": {"message": "daily quota exhausted private-provider-message"}},
+    {"error": {"details": [{"retryDelay": "0.25s"}]}},
+    {"error": {"details": {"retryDelay": "0.25s"}}},
+    _retry_info("NaNs"), _retry_info("infs"), _retry_info("-1s"),
+    _retry_info("0s"), _retry_info("0.25"), _retry_info(0.25),
+    _retry_info(None), _retry_info("1" * 400 + "s"),
+])
+def test_batch_embed_does_not_invent_retry_delay_or_log_raw_errors(monkeypatch, capsys, payload):
+    calls, sleeps = [], []
+
+    def urlopen(request, timeout):
+        calls.append(timeout)
+        raise knowledge.urllib.error.HTTPError(
+            request.full_url, 429, "private-provider-message", {},
+            BytesIO(payload if isinstance(payload, bytes) else json.dumps(payload).encode()),
+        )
+
+    monkeypatch.setattr(knowledge, "GEMINI_API_KEY", "test-key")
+    monkeypatch.setattr(knowledge.urllib.request, "urlopen", urlopen)
+    assert knowledge.embed_batch(["first"], dim=2, timeout_seconds=1, sleep=sleeps.append) is None
+    assert len(calls) == 1
+    assert sleeps == []
+    assert "private-provider-message" not in capsys.readouterr().out
+
+
+@pytest.mark.parametrize("response_time,oversleep,code,expected_calls", [
+    (0.8, 0, 429, 1), (0.1, 1, 429, 1), (0.1, 0, 429, 2), (0.1, 0, 503, 1),
+])
+def test_json_retry_respects_fresh_budget_retry_limit_and_http_status(
+    monkeypatch, capsys, response_time, oversleep, code, expected_calls,
+):
+    now = [0.0]
+    calls, sleeps = [], []
+
+    class ErrorBody(BytesIO):
+        def read(self, *args):
+            now[0] += response_time
+            return super().read(*args)
+
+    def urlopen(request, timeout):
+        calls.append(timeout)
+        raise knowledge.urllib.error.HTTPError(
+            request.full_url, code, "private-provider-message", {},
+            ErrorBody(json.dumps(_retry_info("0.25s")).encode()),
+        )
+
+    def sleep(seconds):
+        sleeps.append(seconds)
+        now[0] += seconds + oversleep
+
+    monkeypatch.setattr(knowledge, "GEMINI_API_KEY", "test-key")
+    monkeypatch.setattr(knowledge.time, "monotonic", lambda: now[0])
+    monkeypatch.setattr(knowledge.urllib.request, "urlopen", urlopen)
+    assert knowledge.embed_batch(["first"], dim=2, timeout_seconds=1, sleep=sleep) is None
+    assert len(calls) == expected_calls
+    assert sleeps == ([0.25] if response_time == 0.1 and code == 429 else [])
+    assert "private-provider-message" not in capsys.readouterr().out
+
+
+def test_batch_embed_sanitizes_transport_errors(monkeypatch, capsys):
+    def urlopen(*args, **kwargs):
+        raise OSError("private-provider-message")
+
+    monkeypatch.setattr(knowledge, "GEMINI_API_KEY", "test-key")
+    monkeypatch.setattr(knowledge.urllib.request, "urlopen", urlopen)
+    assert knowledge.embed_batch(["first"], dim=2) is None
+    assert "private-provider-message" not in capsys.readouterr().out

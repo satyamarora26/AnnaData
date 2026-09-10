@@ -255,13 +255,12 @@ def ingest_source(
             if vectors is None or len(vectors) != len(batch):
                 rejected += len(batch)
                 break
-            for index, (text, vector) in enumerate(zip(batch, vectors), start=offset):
-                remaining_seconds()
-                if knowledge.stage_document(run_id, spec, content_hash, text, index, vector):
-                    stored += 1
-                else:
-                    rejected += 1
-                remaining_seconds()
+            remaining_seconds()
+            stored += knowledge.stage_documents(
+                run_id, spec, content_hash, batch, offset, vectors,
+                deadline_at=deadline_at,
+            )
+            remaining_seconds()
     except (Exception, KeyboardInterrupt) as exc:
         if isinstance(exc, TimeoutError):
             error = "ingestion deadline exceeded"

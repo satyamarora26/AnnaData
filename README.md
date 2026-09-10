@@ -2,6 +2,13 @@
 
 AI agricultural advisory for Indian farmers, reachable over the **web** and over **plain SMS** (no smartphone or internet needed on the farmer's side).
 
+Current verification and deployment boundaries: [API access](docs/API_ACCESS.md),
+[reproducible benchmarks](docs/BENCHMARKS.md), [browser checks](docs/BROWSER_TESTS.md),
+and [official source acquisition](docs/SOURCE_ACQUISITION.md). This is a verified
+local demo, not a claim of field validation or unrestricted production readiness.
+SMS remains an opt-in integration and must not be publicly exposed until its
+webhook and scheduler ingress are authenticated.
+
 ```
                                   ┌──────────────────────────┐
   Farmer (web)  ──────────────▶   │  Frontend (React/CRA)    │
@@ -30,7 +37,7 @@ AI agricultural advisory for Indian farmers, reachable over the **web** and over
 | SMS bridge | `AnnaData-SMS-main` | Python 3.11+ / Quart | Render web service |
 | Web frontend | `AnnaData-Frontend-main` | Node 18+ / CRA | Render static site |
 
-All three deploy together from `render.yaml`. AWS configs are committed too — see section 4.
+The default `render.yaml` deploys the backend and frontend only. AWS configs are committed too — see section 4.
 
 ---
 
@@ -40,7 +47,7 @@ All three deploy together from `render.yaml`. AWS configs are committed too — 
 
 | Credential | Unlocks | Without it | Cost | Where |
 |---|---|---|---|---|
-| `GEMINI_API_KEY` | **Everything** | Service refuses to start | Free tier is 20 req/day/model — see below | [aistudio.google.com/apikey](https://aistudio.google.com/apikey) |
+| `GEMINI_API_KEY` | AI responses and embeddings | AI responses unavailable | Account/model-specific quotas; see below | [aistudio.google.com/apikey](https://aistudio.google.com/apikey) |
 | `GOV_API_KEY` | Mandi (market) prices | Advice omits prices | Free | [data.gov.in](https://data.gov.in/) → register → profile → API key |
 | *(none needed)* | Place name → coordinates | — | Free | OpenStreetMap Nominatim, used by default. `LOCATION_API_KEY` switches to Google Maps if you want better handling of village names |
 | `EE_SERVICE_KEY` | Soil texture / pH / carbon | Advice omits soil | Free (non-commercial) | [Earth Engine](https://earthengine.google.com/) → service account JSON, as one line |
@@ -51,15 +58,17 @@ Weather needs no key — Open-Meteo is open access.
 
 ### Gemini quota — the binding constraint
 
-The free tier allows **20 `generateContent` requests per day, per model**. One farmer question costs **2 calls** (parse + answer), so a free-tier key serves roughly **10 questions per day in total** before every reply becomes the fallback apology. That is fine for testing and unusable in the field.
-
-**Enable billing on the Google Cloud project behind the key before going live.** Nothing in the code changes; the same key stops being rate-limited.
-
-Quota is tracked per model, so switching `TEXT_MODEL` gives a fresh 20/day — useful for testing, not a fix.
+Quotas depend on the model and project tier and include requests/tokens per minute
+and requests per day. Check the project's actual limits in AI Studio; do not
+infer capacity from a single successful request. See [Google's rate-limit
+documentation](https://ai.google.dev/gemini-api/docs/rate-limits). Limits apply
+per project, not per API key. Respect provider retry delays and stop when an
+allowance is exhausted. This demo does not require enabling billing, and no
+paid upgrade is authorized by these instructions.
 
 ### Model selection
 
-`gemini-2.0-flash` and the `gemini-2.5-*` line are **no longer callable by new API keys** — the API returns 404 pointing at the 3.x line. Current defaults:
+Model availability depends on the configured project. Current code defaults:
 
 `TEXT_MODELS` is a comma-separated chain, **fastest first**. Each model is tried in order; a quota (429), overload (503) or missing-model (404) error fails over to the next.
 
@@ -68,9 +77,13 @@ Quota is tracked per model, so switching `TEXT_MODEL` gives a fresh 20/day — u
 | `TEXT_MODELS` | `gemini-3.1-flash-lite,gemini-3.6-flash,gemini-3.5-flash-lite` |
 | `MEDIA_MODEL` | `gemini-3.5-flash-lite` |
 
-Measured end-to-end agent latency: **2.4s mean** on the current primary, versus ~23s on `gemini-3.6-flash`. Answers stayed correct and specific across Hinglish, Devanagari and English in testing.
+The saved five-case live safety run on 2026-09-10 passed 5/5 assertions, with
+8.75s mean, 8.39s p50 and 10.33s p95 direct-agent latency. This small suite is
+not a production-accuracy estimate or a load test. See [the report](docs/evidence/annadata-live-safety.json).
 
-Two things make failover fast. The retry budget is bound as a *call* kwarg — `langchain_google_genai` reads `max_retries` from call kwargs and otherwise silently defaults to 6 attempts with exponential backoff, which stalls ~60s on a dead model before the next is tried. Bound correctly, the same failover takes ~1s. And because free-tier quota is **per model**, the chain also multiplies usable daily capacity.
+The retry budget is bound as a call kwarg. Fallback behavior improves resilience
+when a configured model is unavailable; it does not promise extra account quota
+or a fixed response time.
 
 Note that `models.list` reports models the key **cannot** actually invoke. Verify with a real `generateContent` call before changing these.
 
@@ -275,8 +288,9 @@ SMS billing depends on the alphabet. Latin text packs **153 characters per segme
 
 ### Render (recommended first deploy)
 
-No credit card, no AWS account, and `render.yaml` already describes all three
-services, so this is one Blueprint rather than three separate setups.
+`render.yaml` describes a free backend and a static frontend. Confirm the plan
+and any account-verification requirements in Render before submitting. Do not
+deploy the SMS bridge publicly without verified webhook/scheduler access.
 
 **Step 1 — put the code on GitHub.** The repo is already initialised and
 committed locally. Create an empty repo at [github.com/new](https://github.com/new)
@@ -291,12 +305,12 @@ git push -u origin main
 **Step 2 — create the Blueprint.** At
 [dashboard.render.com/blueprints](https://dashboard.render.com/blueprints) →
 **New Blueprint Instance** → pick the repo. Render reads `render.yaml` and
-offers all three services.
+offers the backend and frontend services.
 
 **Step 3 — fill in the secrets Render prompts for.** Only `GEMINI_API_KEY` is
-required to get the web app working. `APP_USERNAME` and `PASSWORD` come from the
-Android app and are needed for SMS. Leave the rest blank; `/health` will report
-what is enabled.
+required to get AI responses working. `DATABASE_URL` enables the verified
+knowledge store. Import only approved backend secrets; never place them in
+frontend build variables. `/health` reports which integrations are enabled.
 
 **Step 4 — wire the services together.** Render cannot do this for you: its
 `fromService` resolves to an *internal* hostname (the bare service name, with no

@@ -200,9 +200,9 @@ function Main() {
                     <img src={assets.user_icon} alt="User" className="w-10 h-10 rounded-full mr-2" />
                     <p className="text-xl font-semibold">{recentPrompt}</p>
                   </div>
-                  <hr className="border-none w-[800px] h-[20px] bg-gradient-to-r from-[#9ed7ff] via-[#ffffff] to-[#9ed7ff] hr-animated" />
-                  <hr className="border-none w-[800px] h-[20px] bg-gradient-to-r from-[#9ed7ff] via-[#ffffff] to-[#9ed7ff] hr-animated" />
-                  <hr className="border-none w-[800px] h-[20px] bg-gradient-to-r from-[#9ed7ff] via-[#ffffff] to-[#9ed7ff] hr-animated" />
+                  <hr className="border-none w-full max-w-[800px] h-[20px] bg-gradient-to-r from-[#9ed7ff] via-[#ffffff] to-[#9ed7ff] hr-animated" />
+                  <hr className="border-none w-full max-w-[800px] h-[20px] bg-gradient-to-r from-[#9ed7ff] via-[#ffffff] to-[#9ed7ff] hr-animated" />
+                  <hr className="border-none w-full max-w-[800px] h-[20px] bg-gradient-to-r from-[#9ed7ff] via-[#ffffff] to-[#9ed7ff] hr-animated" />
                 </div>
               )}
             </div>
@@ -224,27 +224,31 @@ function Main() {
             value={!loading ? input : ""}
             type="text"
             placeholder="Enter a prompt here"
-            className="flex-grow bg-gray-100 outline-none text-gray-700 placeholder-gray-500"
+            aria-label="Message"
+            className="min-w-0 flex-grow bg-gray-100 outline-none text-gray-700 placeholder-gray-500"
           />
           <div className="flex items-center space-x-3 opacity-65">
-            <label htmlFor="image-upload" className="cursor-pointer">
+            <label htmlFor="image-upload" className="cursor-pointer" title="Attach image">
               <FaImage />
               <input
                 id="image-upload"
                 type="file"
                 accept="image/*"
+                aria-label="Attach image"
                 onChange={handleImageChange}
                 style={{ display: 'none' }}
               />
             </label>
             <button
               type="button"
+              aria-label={isRecording ? 'Stop recording' : 'Record audio'}
+              title={isRecording ? 'Stop recording' : 'Record audio'}
               onClick={handleAudioRecord}
               className={isRecording ? 'text-red-500' : ''}
             >
               <FaMicrophone />
             </button>
-            <button type="submit" disabled={loading}>
+            <button type="submit" disabled={loading} aria-label="Send message" title="Send message">
               <IoMdSend />
             </button>
           </div>

@@ -86,6 +86,31 @@ FEEDBACK_WINDOW_HOURS = int(_get("FEEDBACK_WINDOW_HOURS", "48"))
 FRONTEND_URL = _get("FRONTEND_URL")
 CORS_ORIGINS = _get("CORS_ORIGINS")              # comma-separated, optional
 
+# Server-to-server only; never expose through a frontend build variable.
+API_SERVICE_TOKEN = _get("API_SERVICE_TOKEN")
+
+
+def _positive_int(name: str, default: int) -> int:
+    try:
+        value = int(_get(name, str(default)))
+    except (TypeError, ValueError):
+        raise ValueError(f"{name} must be a positive integer") from None
+    if value <= 0:
+        raise ValueError(f"{name} must be a positive integer")
+    return value
+
+
+# In-memory limits require one worker and one instance. See docs/API_ACCESS.md.
+API_RATE_WINDOW_SECONDS = _positive_int("API_RATE_WINDOW_SECONDS", 60)
+API_RATE_PER_CLIENT = _positive_int("API_RATE_PER_CLIENT", 12)
+API_RATE_GLOBAL = _positive_int("API_RATE_GLOBAL", 120)
+API_RATE_MAX_CLIENTS = _positive_int("API_RATE_MAX_CLIENTS", 2048)
+API_MAX_CONCURRENT_REQUESTS = _positive_int("API_MAX_CONCURRENT_REQUESTS", 4)
+API_BODY_READ_TIMEOUT_SECONDS = _positive_int("API_BODY_READ_TIMEOUT_SECONDS", 15)
+API_MAX_REQUEST_BYTES = _positive_int("API_MAX_REQUEST_BYTES", 65536)
+API_MAX_UPLOAD_BYTES = _positive_int("API_MAX_UPLOAD_BYTES", 5242880)
+API_MAX_MEDIA_REQUEST_BYTES = _positive_int("API_MAX_MEDIA_REQUEST_BYTES", 11534336)
+
 # --- Models ---
 # gemini-2.0-flash and gemini-2.5-* are no longer callable by new API keys; the
 # API returns 404 pointing at the 3.x line. Note that models.list reports models

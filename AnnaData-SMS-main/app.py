@@ -73,13 +73,16 @@ def mark_processed(message_id: str):
 async def forget_farmer(phone: str) -> bool:
     """Erase everything stored about this number."""
     url = config.forget_url()
-    if not url:
+    if not url or not config.API_SERVICE_TOKEN:
         return False
     http = http_session()
     try:
         async with http.post(url, json={"user_id": phone},
+                             headers=config.backend_headers(), allow_redirects=False,
                              timeout=aiohttp.ClientTimeout(total=30)) as resp:
-            return resp.status == 200
+            if resp.status != 200:
+                return False
+            return (await resp.json(content_type=None)).get("erased") is True
     except Exception as e:
         print(f"Erase request failed for {phone}: {e}")
         return False
@@ -92,12 +95,13 @@ async def record_rating(phone: str, message: str) -> bool:
     farming question - a farmer replying "4" is not asking about anything.
     """
     base = config.backend_base()
-    if not base:
+    if not base or not config.API_SERVICE_TOKEN:
         return False
     http = http_session()
     try:
         async with http.post(f"{base}/feedback/rating",
                              json={"user_id": phone, "message": message},
+                             headers=config.backend_headers(), allow_redirects=False,
                              timeout=aiohttp.ClientTimeout(total=30)) as resp:
             if resp.status != 200:
                 return False
@@ -111,24 +115,32 @@ async def record_rating(phone: str, message: str) -> bool:
 async def send_feedback_requests() -> dict:
     """Ask farmers whose conversation has finished to rate it."""
     base = config.backend_base()
-    if not base:
-        return {"asked": 0, "reason": "no backend configured"}
+    if not base or not config.API_SERVICE_TOKEN:
+        return {"asked": 0, "reason": "backend access is not configured"}
 
     http = http_session()
     try:
         async with http.get(f"{base}/feedback/due",
+                            headers=config.backend_headers(), allow_redirects=False,
                             timeout=aiohttp.ClientTimeout(total=60)) as resp:
+            if resp.status != 200:
+                return {"asked": 0, "error": "Backend feedback request failed"}
             due = (await resp.json(content_type=None)).get("due", [])
     except Exception as e:
         print(f"Could not fetch farmers due for feedback: {e}")
-        return {"asked": 0, "error": str(e)[:120]}
+        return {"asked": 0, "error": "Backend feedback request failed"}
 
     asked = 0
     for phone in due:
         if await send_sms(phone, config.FEEDBACK_PROMPT):
             try:
-                await http.post(f"{base}/feedback/asked", json={"user_id": phone},
-                                timeout=aiohttp.ClientTimeout(total=30))
+                async with http.post(
+                    f"{base}/feedback/asked", json={"user_id": phone},
+                    headers=config.backend_headers(), allow_redirects=False,
+                    timeout=aiohttp.ClientTimeout(total=30),
+                ) as resp:
+                    if resp.status != 200:
+                        print("Could not mark feedback as asked")
             except Exception as e:
                 print(f"Could not mark {phone} as asked: {e}")
             asked += 1
@@ -141,8 +153,8 @@ async def send_feedback_requests() -> dict:
 async def generate_response(message: str, phone: str, message_id: str | None,
                             channel: str = "sms") -> str | None:
     """Ask the agent backend for a reply, already trimmed for SMS."""
-    if not config.AI_ENDPOINT:
-        print("AI_ENDPOINT not configured")
+    if not config.AI_ENDPOINT or not config.API_SERVICE_TOKEN:
+        print("Backend access is not configured")
         return None
 
     http = http_session()
@@ -166,7 +178,7 @@ async def generate_response(message: str, phone: str, message_id: str | None,
             async with http.post(
                 config.AI_ENDPOINT,
                 json=payload,
-                headers={"accept": "application/json", "Content-Type": "application/json"},
+                headers=config.backend_headers(), allow_redirects=False,
                 timeout=aiohttp.ClientTimeout(total=config.AI_TIMEOUT),
             ) as resp:
                 body = await resp.text()
@@ -293,8 +305,8 @@ async def process_sms(data: dict):
     # agent being reachable.
     if msg.strip().lower() in config.STOP_WORDS:
         print(f"Opt-out from {phone}")
-        await forget_farmer(phone)
-        await send_sms(phone, config.STOP_REPLY)
+        erased = await forget_farmer(phone)
+        await send_sms(phone, config.STOP_REPLY if erased else config.STOP_FAILURE_REPLY)
         return
 
     # A reply to the rating request is a number, not a question. Checking
@@ -336,17 +348,18 @@ async def health():
     # process is alive"; GET answers "and here is what it can reach".
     backend_ok = None
     base = config.backend_base()
-    if base and request.method != "HEAD":
+    if base and config.API_SERVICE_TOKEN and request.method != "HEAD":
         try:
             async with http_session().get(
-                f"{base}/health", timeout=aiohttp.ClientTimeout(total=15)
+                f"{base}/health", headers=config.backend_headers(), allow_redirects=False,
+                timeout=aiohttp.ClientTimeout(total=15)
             ) as resp:
                 backend_ok = resp.status == 200
             if not backend_ok:
                 problems.append(f"agent backend returned HTTP {resp.status}")
         except Exception as e:
             backend_ok = False
-            problems.append(f"agent backend unreachable: {str(e)[:80]}")
+            problems.append("agent backend unreachable")
 
     return jsonify({
         "status": "ok" if not problems else "degraded",
@@ -402,8 +415,9 @@ async def process_whatsapp(incoming: dict):
 
     if text.strip().lower() in config.STOP_WORDS:
         print(f"Opt-out from {sender}")
-        await forget_farmer(sender)
-        await whatsapp.send(http_session(), sender, config.STOP_REPLY)
+        erased = await forget_farmer(sender)
+        await whatsapp.send(http_session(), sender,
+                            config.STOP_REPLY if erased else config.STOP_FAILURE_REPLY)
         return
 
     if await record_rating(sender, text):
