@@ -212,6 +212,50 @@ def test_deadline_before_activation_rolls_back_after_staging(tmp_path, monkeypat
     assert failures == [(22, "ingestion deadline exceeded", 1, 1, 0)]
 
 
+def test_activation_deadline_failure_is_terminally_recorded(tmp_path, monkeypatch):
+    path = tmp_path / "guidance.txt"
+    path.write_text(_guidance_text(), encoding="utf-8")
+    failures = []
+    monkeypatch.setattr(ingestion, "chunk_text", lambda text: [text])
+    monkeypatch.setattr(ingestion.knowledge, "start_ingestion", lambda *args: 23)
+    monkeypatch.setattr(
+        ingestion.knowledge, "embed_batch", lambda texts, **kwargs: [[0.0] * 768]
+    )
+    monkeypatch.setattr(ingestion.knowledge, "stage_document", lambda *args: True)
+    monkeypatch.setattr(
+        ingestion.knowledge,
+        "activate_documents",
+        lambda *args, **kwargs: (_ for _ in ()).throw(
+            ingestion.knowledge.ActivationDeadlineExceeded("activation deadline exceeded")
+        ),
+    )
+    monkeypatch.setattr(ingestion.knowledge, "fail_ingestion", lambda *args: failures.append(args))
+
+    result = ingestion.ingest_source(_spec(), path, deadline_seconds=30)
+
+    assert result.status == "failed"
+    assert failures == [(23, "ingestion deadline exceeded", 1, 1, 0)]
+
+
+def test_ambiguous_activation_rejection_is_terminally_recorded(tmp_path, monkeypatch):
+    path = tmp_path / "guidance.txt"
+    path.write_text(_guidance_text(), encoding="utf-8")
+    failures = []
+    monkeypatch.setattr(ingestion, "chunk_text", lambda text: [text])
+    monkeypatch.setattr(ingestion.knowledge, "start_ingestion", lambda *args: 24)
+    monkeypatch.setattr(
+        ingestion.knowledge, "embed_batch", lambda texts, **kwargs: [[0.0] * 768]
+    )
+    monkeypatch.setattr(ingestion.knowledge, "stage_document", lambda *args: True)
+    monkeypatch.setattr(ingestion.knowledge, "activate_documents", lambda *args, **kwargs: False)
+    monkeypatch.setattr(ingestion.knowledge, "fail_ingestion", lambda *args: failures.append(args))
+
+    result = ingestion.ingest_source(_spec(), path, deadline_seconds=30)
+
+    assert result.status == "failed"
+    assert failures == [(24, "document activation was rejected", 1, 1, 0)]
+
+
 def test_fetch_rejects_invalid_replacement_without_overwriting_local_file(tmp_path, monkeypatch):
     cli = _cli_module()
     spec = _spec()

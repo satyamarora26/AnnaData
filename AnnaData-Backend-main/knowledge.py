@@ -32,6 +32,26 @@ from source_catalog import SourceSpec, scope_score
 
 EMBED_MODEL = "gemini-embedding-001"
 EMBED_DIM = 768
+ACTIVATION_TIMEOUT_SECONDS = 60
+ACTIVATION_TIMEOUT_SQLSTATES = {"57014", "25P04"}
+
+
+class ActivationError(RuntimeError):
+    """A document activation could not complete atomically."""
+
+
+class ActivationDeadlineExceeded(ActivationError):
+    """The activation deadline expired locally or in PostgreSQL."""
+
+
+class ActivationDeadlineUnsupported(ActivationError):
+    """The database cannot enforce a transaction-wide activation deadline."""
+
+
+class ActivationStateError(ActivationError):
+    """The ingestion audit is missing, terminal, or does not match the activation."""
+
+
 TIER_PRIORITY = {"official": 2, "extension": 1, "reference": 0}
 
 SCHEMA = f"""
@@ -188,7 +208,9 @@ def embed_batch(
                 delay = float(retry_after) if retry_after is not None else 0
             except ValueError:
                 delay = 0
-            if exc.code != 429 or attempt or delay <= 0 or delay >= remaining:
+            remaining = timeout_seconds - (time.monotonic() - started_at)
+            if (exc.code != 429 or attempt or not math.isfinite(delay)
+                    or delay <= 0 or delay >= remaining):
                 print(f"Batch embedding failed: HTTP Error {exc.code}: {exc.reason}")
                 return None
             sleep(delay)
@@ -487,38 +509,40 @@ def stage_document(run_id: int, spec: SourceSpec, content_hash: str,
 def activate_documents(run_id: int, spec: SourceSpec, content_hash: str,
                        parsed: int, stored: int, rejected: int,
                        deadline_at: float | None = None,
-                       timeout_seconds: float | None = None,
+                       timeout_seconds: float | None = ACTIVATION_TIMEOUT_SECONDS,
                        clock=time.monotonic) -> bool:
     """Atomically replace a source only when every parsed chunk was staged."""
-    running_run = False
+    if deadline_at is None:
+        if timeout_seconds is None:
+            raise ActivationDeadlineUnsupported("document activation requires a deadline")
+        deadline_at = clock() + timeout_seconds
+
+    def remaining_milliseconds() -> int:
+        milliseconds = int((deadline_at - clock()) * 1000)
+        if milliseconds < 1:
+            raise ActivationDeadlineExceeded("ingestion deadline exceeded during activation")
+        return milliseconds
+
     try:
         with db.connection() as conn:
-            if deadline_at is None and timeout_seconds is not None:
-                deadline_at = clock() + timeout_seconds
-
             def execute(sql: str, params=()):
-                if deadline_at is not None:
-                    remaining = deadline_at - clock()
-                    if remaining <= 0:
-                        raise TimeoutError("ingestion deadline exceeded during activation")
-                    conn.execute(
-                        "SET LOCAL statement_timeout = %s",
-                        (max(1, int(remaining * 1000)),),
-                    )
+                conn.execute(
+                    "SELECT set_config('statement_timeout', %s, true)",
+                    (f"{remaining_milliseconds()}ms",),
+                )
                 return conn.execute(sql, params)
 
-            if deadline_at is not None:
-                supports_transaction_timeout = execute(
-                    "SELECT current_setting('transaction_timeout', true)"
-                ).fetchone()
-                if supports_transaction_timeout and supports_transaction_timeout[0] is not None:
-                    remaining = deadline_at - clock()
-                    if remaining <= 0:
-                        raise TimeoutError("ingestion deadline exceeded during activation")
-                    conn.execute(
-                        "SET LOCAL transaction_timeout = %s",
-                        (max(1, int(remaining * 1000)),),
-                    )
+            transaction_timeout = execute(
+                "SELECT current_setting('transaction_timeout', true)"
+            ).fetchone()
+            if not transaction_timeout or transaction_timeout[0] is None:
+                raise ActivationDeadlineUnsupported(
+                    "database does not support transaction_timeout; activation rejected"
+                )
+            conn.execute(
+                "SELECT set_config('transaction_timeout', %s, true)",
+                (f"{remaining_milliseconds()}ms",),
+            )
 
             execute(
                 "SELECT pg_advisory_xact_lock(hashtext(%s))",
@@ -531,7 +555,7 @@ def activate_documents(run_id: int, spec: SourceSpec, content_hash: str,
                 (run_id,),
             ).fetchone()
             if audit is None:
-                return False
+                raise ActivationStateError(f"ingestion audit {run_id} was not found")
             (audit_source, audit_hash, audit_status, audit_parsed, audit_stored,
              audit_rejected) = audit
             if audit_status == "completed":
@@ -539,7 +563,9 @@ def activate_documents(run_id: int, spec: SourceSpec, content_hash: str,
                         or audit_parsed != parsed or audit_stored != stored
                         or audit_rejected != rejected or parsed <= 0
                         or stored != parsed or rejected):
-                    return False
+                    raise ActivationStateError(
+                        f"completed ingestion audit {run_id} does not match activation"
+                    )
                 active_count, owned_active_count = execute(
                     """SELECT count(*) AS active_count,
                               count(*) FILTER (
@@ -550,14 +576,23 @@ def activate_documents(run_id: int, spec: SourceSpec, content_hash: str,
                         WHERE source = %s AND active = TRUE""",
                     (run_id, spec.id, content_hash, spec.id),
                 ).fetchone()
-                return active_count == stored and owned_active_count == stored
+                if active_count != stored or owned_active_count != stored:
+                    raise ActivationStateError(
+                        f"completed ingestion audit {run_id} does not own the active corpus"
+                    )
+                remaining_milliseconds()
+                conn.commit()
+                return True
             if audit_status != "running":
-                return False
-            running_run = True
+                raise ActivationStateError(
+                    f"ingestion audit {run_id} is already {audit_status}"
+                )
             if audit_source != spec.id or audit_hash != content_hash:
-                return False
+                raise ActivationStateError(
+                    f"running ingestion audit {run_id} does not match activation"
+                )
             if parsed <= 0 or stored != parsed or rejected:
-                raise ValueError("replacement corpus was incomplete")
+                raise ActivationError("replacement corpus was incomplete")
             staged_count, owned_count = execute(
                 """SELECT count(*) AS staged_count,
                           count(*) FILTER (
@@ -568,7 +603,7 @@ def activate_documents(run_id: int, spec: SourceSpec, content_hash: str,
                 (spec.id, content_hash, run_id),
             ).fetchone()
             if staged_count != parsed or owned_count != parsed:
-                raise ValueError("staged document ownership/count mismatch")
+                raise ActivationError("staged document ownership/count mismatch")
             execute(
                 "UPDATE documents SET active = FALSE WHERE source = %s AND active = TRUE",
                 (spec.id,),
@@ -597,26 +632,29 @@ def activate_documents(run_id: int, spec: SourceSpec, content_hash: str,
                     WHERE id = %s""",
                 (parsed, stored, rejected, run_id),
             )
-        return True
+            remaining_milliseconds()
+            conn.commit()
+            return True
     except Exception as exc:
-        if not running_run:
-            print(f"Could not inspect document activation: {exc}")
-            return False
-        failure_error = f"activation failed: {exc}"
-        try:
-            fail_ingestion(run_id, failure_error, parsed, stored, rejected)
-        except Exception as audit_exc:
-            raise RuntimeError(
-                f"{exc}; unable to record ingestion failure: {audit_exc}"
-            ) from audit_exc
-        print(f"Could not activate documents: {exc}")
-        return False
+        if isinstance(exc, ActivationError):
+            raise
+        if getattr(exc, "sqlstate", None) in ACTIVATION_TIMEOUT_SQLSTATES:
+            raise ActivationDeadlineExceeded(
+                "ingestion deadline exceeded during activation"
+            ) from exc
+        raise ActivationError(str(exc)) from exc
 
 
 def fail_ingestion(run_id: int, error: str, parsed: int = 0,
-                   stored: int = 0, rejected: int = 0) -> None:
+                   stored: int = 0, rejected: int = 0) -> bool:
     """Discard incomplete staged chunks and preserve their audit outcome."""
     with db.connection() as conn:
+        audit = conn.execute(
+            "SELECT status FROM ingestion_runs WHERE id = %s FOR UPDATE",
+            (run_id,),
+        ).fetchone()
+        if audit is None or audit[0] != "running":
+            return False
         conn.execute(
             "DELETE FROM documents WHERE ingestion_run_id = %s AND active = FALSE",
             (run_id,),
@@ -627,6 +665,7 @@ def fail_ingestion(run_id: int, error: str, parsed: int = 0,
                       completed_at = now() WHERE id = %s""",
             (error[:2000], parsed, stored, rejected, run_id),
         )
+    return True
 
 
 def record_ingestion_failure(kind: str, source: str, source_url: str,

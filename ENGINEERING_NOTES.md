@@ -994,6 +994,54 @@ failed. The current browser controller evidence is likewise not a pass: backend
 and frontend rendered on 8013/3013, but native CUA `setValue`/`fill` followed
 by click/Return did not change the form or emit a backend request.
 
+### Task 8 fix round 4 (2026-09-10)
+
+Activation failures are now typed and observable. `activate_documents` raises
+an activation, deadline, unsupported-deadline, or audit-state error instead of
+turning failures into an ambiguous `False`. The ingestion caller records the
+failure in a separate transaction. `fail_ingestion` first locks and inspects
+the audit, and deletes staging rows and marks failure only while that audit is
+still `running`; a concurrent or retried `completed`, `failed`, or `skipped`
+audit is left untouched.
+
+Publishing is fail-closed. Every activation has a finite default or aggregate
+deadline, floors remaining time to whole milliseconds, and rejects a remaining
+budget below 1 ms rather than rounding it up. PostgreSQL must expose
+`transaction_timeout`; the timeout is installed before document mutation,
+each statement also receives the floored remaining `statement_timeout`, and a
+final clock check precedes the explicit commit. Local or PostgreSQL statement
+and transaction timeout errors are raised as `ActivationDeadlineExceeded`, so
+the caller can terminally record them after the activation transaction rolls
+back. The configured live database identified itself as PostgreSQL **18.6**,
+reported `transaction_timeout` support, and accepted parameterized,
+transaction-local 1-second statement and transaction settings; that capability
+probe changed no corpus rows.
+
+The one-retry Gemini policy remains bounded. HTTP 429 handling now recomputes
+remaining time after the failed request and accepts only a finite, positive
+numeric `Retry-After` strictly smaller than that fresh remainder. The round-3
+bounded attempts had all ended in final HTTP 429 responses and there was no
+material evidence that quota had changed, so no large source was attempted in
+this round and no new idempotence claim is made.
+
+The frontend submission path was exercised through the real context and main
+form with the installed React Testing Library and `user-event`, mocking only
+geolocation and the backend boundary. The test typed a fertilizer question,
+submitted it with Enter, verified the exact `/agent` request body, rendered the
+mocked grounded answer, and observed no added dosage quantity. This separates
+application behavior from the earlier CUA input failure, but it is not a visible
+browser E2E pass.
+
+TDD RED was captured first: the initial six activation-boundary tests all
+failed, then the expanded backend command reported **24 failed and 35 passed**.
+After the repair, focused ingestion, knowledge, and fertilizer-guard tests
+reported **79 passed in 0.11s**. The fertilizer guard alone reported **20
+passed**, preserving the material-specific zinc-versus-DAP behavior. The full
+backend suite reported **128 passed in 1.17s**; `eval/test_feedback.py` exited
+zero and stated that live assertions were disabled. The frontend suite reported
+**2 passed in 1.03s** with no warnings. Its production build compiled
+successfully with only the existing outdated Browserslist data notice.
+
 ### Open-Meteo rate limits by IP, and the IP is shared
 
 Weather worked locally in 2s and failed in production. The cause was

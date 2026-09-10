@@ -221,9 +221,16 @@ def ingest_source(
             run_id, spec, content_hash, len(chunks), stored, 0, **activation_args
         )
     except Exception as exc:
-        error = "ingestion deadline exceeded" if isinstance(exc, TimeoutError) else str(exc)
+        error = (
+            "ingestion deadline exceeded"
+            if isinstance(exc, (TimeoutError, knowledge.ActivationDeadlineExceeded))
+            else str(exc)
+        )
         knowledge.fail_ingestion(run_id, error, len(chunks), stored, len(chunks) - stored)
         return IngestResult(spec.id, "failed", content_hash, len(chunks), stored, len(chunks) - stored)
     if not activated:
+        knowledge.fail_ingestion(
+            run_id, "document activation was rejected", len(chunks), stored, 0
+        )
         return IngestResult(spec.id, "failed", content_hash, len(chunks), stored, 0)
     return IngestResult(spec.id, "completed", content_hash, len(chunks), stored, 0)

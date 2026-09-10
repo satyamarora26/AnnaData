@@ -21,11 +21,12 @@ class Result:
 class RecordingConnection:
     def __init__(self):
         self.calls = []
+        self.commits = 0
         self.ingestion_rows = []
         self.staged_counts = (3, 3)
         self.active_counts = (3, 3)
         self.audit_row = ("pm_kisan_guidelines", "abc123", "running", 0, 0, 0)
-        self.transaction_timeout_setting = None
+        self.transaction_timeout_setting = "0"
         self.errors = {}
 
     def execute(self, sql, params=()):
@@ -38,6 +39,8 @@ class RecordingConnection:
             return Result(None)
         if "RETURNING id" in compact:
             return Result((41,))
+        if "SELECT status FROM ingestion_runs" in compact:
+            return Result((self.audit_row[2],))
         if "FROM ingestion_runs WHERE id = %s FOR UPDATE" in compact:
             return Result(self.audit_row)
         if "current_setting('transaction_timeout', true)" in compact:
@@ -53,6 +56,9 @@ class RecordingConnection:
         if "count(*) FROM documents" in compact:
             return Result((0,))
         return Result()
+
+    def commit(self):
+        self.commits += 1
 
 
 class StatefulActivationConnection(RecordingConnection):
@@ -85,6 +91,8 @@ class StatefulActivationConnection(RecordingConnection):
     def execute(self, sql, params=()):
         compact = " ".join(sql.split())
         self.calls.append((compact, params))
+        if "current_setting('transaction_timeout', true)" in compact:
+            return Result((self.transaction_timeout_setting,))
         if "FROM ingestion_runs WHERE id = %s FOR UPDATE" in compact:
             run = self.runs.get(params[0])
             if run is None:
@@ -200,7 +208,7 @@ def test_document_activation_deactivates_old_version_before_publishing_new(monke
     assert knowledge.activate_documents(41, _spec(), "abc123", 3, 3, 0)
 
     statements = [sql for sql, _ in conn.calls]
-    assert statements[0] == "SELECT pg_advisory_xact_lock(hashtext(%s))"
+    assert "SELECT pg_advisory_xact_lock(hashtext(%s))" in statements
     deactivate_index = statements.index(
         "UPDATE documents SET active = FALSE WHERE source = %s AND active = TRUE"
     )
@@ -211,39 +219,94 @@ def test_document_activation_deactivates_old_version_before_publishing_new(monke
     assert deactivate_index < publish_index
     publish = statements[publish_index]
     assert "source = %s AND content_hash = %s" in publish
-    assert "status = 'completed'" in statements[-1]
+    assert any("status = 'completed'" in statement for statement in statements)
+    assert conn.commits == 1
 
 
-def test_activation_expiry_before_commit_fails_without_completion(monkeypatch):
+def test_activation_expiry_before_audit_inspection_is_typed(monkeypatch):
     conn = _recording_connection(monkeypatch)
 
-    assert not knowledge.activate_documents(
-        41, _spec(), "abc123", 3, 3, 0,
-        deadline_at=10, timeout_seconds=0.5, clock=lambda: 10,
-    )
+    with pytest.raises(knowledge.ActivationDeadlineExceeded):
+        knowledge.activate_documents(
+            41, _spec(), "abc123", 3, 3, 0,
+            deadline_at=10, timeout_seconds=0.5, clock=lambda: 10,
+        )
 
     statements = [sql for sql, _ in conn.calls]
-    assert not any("status = 'failed'" in sql for sql in statements)
+    assert not any("FROM ingestion_runs WHERE id = %s FOR UPDATE" in sql for sql in statements)
     assert not any("status = 'completed'" in sql for sql in statements)
+    assert conn.commits == 0
 
 
-def test_activation_expiry_during_transaction_fails_without_completion(monkeypatch):
+def test_activation_server_timeout_is_raised_as_typed_deadline_failure(monkeypatch):
     conn = _recording_connection(monkeypatch)
-    calls = 0
 
-    def clock():
-        nonlocal calls
-        calls += 1
-        return 0 if calls < 4 else 1
+    class ServerStatementTimeout(RuntimeError):
+        sqlstate = "57014"
 
-    assert not knowledge.activate_documents(
-        41, _spec(), "abc123", 3, 3, 0,
-        deadline_at=1, timeout_seconds=1, clock=clock,
-    )
+    conn.errors["AS staged_count"] = ServerStatementTimeout("statement timeout")
+
+    with pytest.raises(knowledge.ActivationDeadlineExceeded, match="deadline"):
+        knowledge.activate_documents(
+            41, _spec(), "abc123", 3, 3, 0,
+            deadline_at=1, timeout_seconds=1, clock=lambda: 0,
+        )
 
     statements = [sql for sql, _ in conn.calls]
-    assert any("status = 'failed'" in sql for sql in statements)
     assert not any("status = 'completed'" in sql for sql in statements)
+    assert conn.commits == 0
+
+
+def test_activation_rejects_sub_millisecond_budget_without_rounding_up(monkeypatch):
+    conn = _recording_connection(monkeypatch)
+
+    with pytest.raises(knowledge.ActivationDeadlineExceeded):
+        knowledge.activate_documents(
+            41, _spec(), "abc123", 3, 3, 0,
+            deadline_at=0.0009, clock=lambda: 0,
+        )
+
+    assert not any(params == ("1ms",) for _, params in conn.calls)
+    assert not any("UPDATE documents" in sql for sql, _ in conn.calls)
+    assert conn.commits == 0
+
+
+def test_activation_rejects_unsupported_transaction_timeout_before_mutation(monkeypatch):
+    conn = _recording_connection(monkeypatch)
+    conn.transaction_timeout_setting = None
+
+    with pytest.raises(knowledge.ActivationDeadlineUnsupported):
+        knowledge.activate_documents(
+            41, _spec(), "abc123", 3, 3, 0,
+            deadline_at=10, clock=lambda: 0,
+        )
+
+    assert not any("UPDATE documents" in sql for sql, _ in conn.calls)
+    assert not any("status = 'completed'" in sql for sql, _ in conn.calls)
+    assert conn.commits == 0
+
+
+def test_activation_checks_deadline_after_final_statement_before_commit(monkeypatch):
+    now = [0.0]
+
+    class FinalStatementConnection(RecordingConnection):
+        def execute(self, sql, params=()):
+            result = super().execute(sql, params)
+            if "SET status = 'completed'" in " ".join(sql.split()):
+                now[0] = 1.0
+            return result
+
+    conn = FinalStatementConnection()
+    monkeypatch.setattr(knowledge.db, "is_available", lambda: True)
+    monkeypatch.setattr(knowledge.db, "connection", lambda: nullcontext(conn))
+
+    with pytest.raises(knowledge.ActivationDeadlineExceeded):
+        knowledge.activate_documents(
+            41, _spec(), "abc123", 3, 3, 0,
+            deadline_at=1, clock=lambda: now[0],
+        )
+
+    assert conn.commits == 0
 
 
 def test_activation_uses_transaction_timeout_when_server_supports_it(monkeypatch):
@@ -256,15 +319,17 @@ def test_activation_uses_transaction_timeout_when_server_supports_it(monkeypatch
     )
 
     statements = [sql for sql, _ in conn.calls]
-    assert any("SET LOCAL transaction_timeout" in sql for sql in statements)
+    assert any("set_config('transaction_timeout'" in sql for sql in statements)
 
 
 def test_partial_stage_is_rejected_without_deactivating_current_corpus(monkeypatch):
     conn = _recording_connection(monkeypatch)
 
-    assert not knowledge.activate_documents(41, _spec(), "abc123", 3, 2, 1)
+    with pytest.raises(knowledge.ActivationError, match="incomplete"):
+        knowledge.activate_documents(41, _spec(), "abc123", 3, 2, 1)
+
     assert not any("SET active = FALSE" in sql for sql, _ in conn.calls)
-    assert any("status = 'failed'" in sql for sql, _ in conn.calls)
+    assert not any("status = 'failed'" in sql for sql, _ in conn.calls)
 
 
 @pytest.mark.parametrize("staged_counts", [(2, 2), (3, 2)])
@@ -272,12 +337,13 @@ def test_stage_count_or_ownership_mismatch_fails_before_deactivation(monkeypatch
     conn = _recording_connection(monkeypatch)
     conn.staged_counts = staged_counts
 
-    assert not knowledge.activate_documents(41, _spec(), "abc123", 3, 3, 0)
+    with pytest.raises(knowledge.ActivationError, match="ownership/count"):
+        knowledge.activate_documents(41, _spec(), "abc123", 3, 3, 0)
 
     statements = [sql for sql, _ in conn.calls]
     assert any("AS staged_count" in sql for sql in statements)
     assert not any("SET active = FALSE" in sql for sql in statements)
-    assert any("status = 'failed'" in sql for sql in statements)
+    assert not any("status = 'failed'" in sql for sql in statements)
 
 
 def test_activation_cleanup_preserves_another_running_stage(monkeypatch):
@@ -294,32 +360,49 @@ def test_activation_cleanup_preserves_another_running_stage(monkeypatch):
     assert params == (_spec().id, 41)
 
 
-def test_activation_error_fails_run_and_cleans_its_staged_rows(monkeypatch):
+def test_activation_error_is_typed_and_left_for_the_caller_to_record(monkeypatch):
     conn = _recording_connection(monkeypatch)
     conn.errors["UPDATE documents SET active = FALSE"] = RuntimeError("activation exploded")
 
-    assert not knowledge.activate_documents(41, _spec(), "abc123", 3, 3, 0)
+    with pytest.raises(knowledge.ActivationError, match="activation exploded"):
+        knowledge.activate_documents(41, _spec(), "abc123", 3, 3, 0)
 
     statements = [sql for sql, _ in conn.calls]
-    assert any("DELETE FROM documents WHERE ingestion_run_id = %s" in sql for sql in statements)
-    assert any("status = 'failed'" in sql for sql in statements)
+    assert not any("DELETE FROM documents WHERE ingestion_run_id = %s" in sql for sql in statements)
+    assert not any("status = 'failed'" in sql for sql in statements)
     assert not any("status = 'completed'" in sql for sql in statements)
 
 
-def test_activation_error_does_not_hide_a_secondary_audit_failure(monkeypatch):
+def test_running_audit_failure_is_terminally_recorded_and_staging_is_cleaned(monkeypatch):
     conn = _recording_connection(monkeypatch)
-    conn.errors["UPDATE documents SET active = FALSE"] = RuntimeError("activation exploded")
-    conn.errors["UPDATE ingestion_runs SET status = 'failed'"] = RuntimeError("audit exploded")
 
-    with pytest.raises(RuntimeError, match="activation exploded; unable to record ingestion failure: audit exploded"):
-        knowledge.activate_documents(41, _spec(), "abc123", 3, 3, 0)
+    assert knowledge.fail_ingestion(41, "activation exploded", 3, 3, 0)
+
+    statements = [sql for sql, _ in conn.calls]
+    assert any("SELECT status FROM ingestion_runs" in sql for sql in statements)
+    assert any("DELETE FROM documents WHERE ingestion_run_id = %s" in sql for sql in statements)
+    assert any("status = 'failed'" in sql for sql in statements)
+
+
+@pytest.mark.parametrize("status", ["completed", "failed", "skipped"])
+def test_fail_ingestion_does_not_corrupt_terminal_audit(monkeypatch, status):
+    conn = _recording_connection(monkeypatch)
+    conn.audit_row = (_spec().id, "abc123", status, 3, 3, 0)
+
+    assert not knowledge.fail_ingestion(41, "late activation failure", 3, 3, 0)
+
+    statements = [sql for sql, _ in conn.calls]
+    assert any("SELECT status FROM ingestion_runs" in sql for sql in statements)
+    assert not any(sql.startswith("DELETE FROM documents") for sql in statements)
+    assert not any("status = 'failed'" in sql for sql in statements)
 
 
 def test_audit_lookup_error_does_not_mutate_the_run(monkeypatch):
     conn = _recording_connection(monkeypatch)
     conn.errors["FROM ingestion_runs WHERE id = %s FOR UPDATE"] = RuntimeError("audit lookup exploded")
 
-    assert not knowledge.activate_documents(41, _spec(), "abc123", 3, 3, 0)
+    with pytest.raises(knowledge.ActivationError, match="audit lookup exploded"):
+        knowledge.activate_documents(41, _spec(), "abc123", 3, 3, 0)
 
     statements = [sql for sql, _ in conn.calls]
     assert not any(sql.startswith("DELETE FROM documents") for sql in statements)
@@ -331,7 +414,8 @@ def test_completed_active_count_error_does_not_mutate_the_run(monkeypatch):
     conn.audit_row = (_spec().id, "abc123", "completed", 3, 3, 0)
     conn.errors["AS active_count"] = RuntimeError("active count exploded")
 
-    assert not knowledge.activate_documents(41, _spec(), "abc123", 3, 3, 0)
+    with pytest.raises(knowledge.ActivationError, match="active count exploded"):
+        knowledge.activate_documents(41, _spec(), "abc123", 3, 3, 0)
 
     statements = [sql for sql, _ in conn.calls]
     assert not any(sql.startswith("DELETE FROM documents") for sql in statements)
@@ -376,7 +460,8 @@ def test_completed_nonmatching_activation_is_rejected_without_audit_mutation(mon
     before_documents = [document.copy() for document in conn.documents]
     conn.calls.clear()
 
-    assert not knowledge.activate_documents(41, _spec(), "wrong-hash", 2, 2, 0)
+    with pytest.raises(knowledge.ActivationStateError, match="does not match"):
+        knowledge.activate_documents(41, _spec(), "wrong-hash", 2, 2, 0)
 
     assert conn.documents == before_documents
     assert conn.runs[41]["status"] == "completed"
@@ -389,11 +474,25 @@ def test_completed_invalid_count_retry_is_rejected_without_audit_mutation(monkey
     before_documents = [document.copy() for document in conn.documents]
     conn.calls.clear()
 
-    assert not knowledge.activate_documents(41, _spec(), "first-hash", 2, 1, 1)
+    with pytest.raises(knowledge.ActivationStateError, match="does not match"):
+        knowledge.activate_documents(41, _spec(), "first-hash", 2, 1, 1)
 
     assert conn.documents == before_documents
     assert conn.runs[41]["status"] == "completed"
     assert not any("status = 'failed'" in sql for sql, _ in conn.calls)
+
+
+@pytest.mark.parametrize("status", ["failed", "skipped"])
+def test_terminal_noncompleted_audit_is_typed_and_not_mutated(monkeypatch, status):
+    conn = _recording_connection(monkeypatch)
+    conn.audit_row = (_spec().id, "abc123", status, 3, 3, 0)
+
+    with pytest.raises(knowledge.ActivationStateError, match=status):
+        knowledge.activate_documents(41, _spec(), "abc123", 3, 3, 0)
+
+    assert not any("UPDATE documents" in sql for sql, _ in conn.calls)
+    assert not any("status = 'failed'" in sql for sql, _ in conn.calls)
+    assert conn.commits == 0
 
 
 def test_stage_document_keeps_new_chunks_inactive_until_activation(monkeypatch):
@@ -527,3 +626,48 @@ def test_batch_embed_retries_one_429_within_its_remaining_budget(monkeypatch):
     assert result == [[0.1, 0.2]]
     assert calls == [1, 1]
     assert sleeps == [0.25]
+
+
+def test_batch_embed_does_not_sleep_when_retry_after_exceeds_fresh_budget(monkeypatch):
+    calls = []
+    sleeps = []
+    clock = iter((0.0, 0.0, 0.8, 0.8))
+
+    def urlopen(request, timeout):
+        calls.append(timeout)
+        raise knowledge.urllib.error.HTTPError(
+            request.full_url, 429, "rate limited", {"Retry-After": "0.3"}, None
+        )
+
+    monkeypatch.setattr(knowledge, "GEMINI_API_KEY", "test-key")
+    monkeypatch.setattr(knowledge.urllib.request, "urlopen", urlopen)
+    monkeypatch.setattr(knowledge.time, "monotonic", lambda: next(clock))
+
+    assert knowledge.embed_batch(
+        ["first"], dim=2, timeout_seconds=1, sleep=sleeps.append,
+    ) is None
+
+    assert len(calls) == 1
+    assert sleeps == []
+
+
+def test_batch_embed_rejects_nonfinite_retry_after(monkeypatch):
+    calls = []
+    sleeps = []
+
+    def urlopen(request, timeout):
+        calls.append(timeout)
+        raise knowledge.urllib.error.HTTPError(
+            request.full_url, 429, "rate limited", {"Retry-After": "nan"}, None
+        )
+
+    monkeypatch.setattr(knowledge, "GEMINI_API_KEY", "test-key")
+    monkeypatch.setattr(knowledge.urllib.request, "urlopen", urlopen)
+    monkeypatch.setattr(knowledge.time, "monotonic", lambda: 0)
+
+    assert knowledge.embed_batch(
+        ["first"], dim=2, timeout_seconds=1, sleep=sleeps.append,
+    ) is None
+
+    assert len(calls) == 1
+    assert sleeps == []

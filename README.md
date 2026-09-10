@@ -149,16 +149,18 @@ python tools/ingest_docs.py --source-id soil_health_card_faq --deadline-seconds 
 
 An expired budget fails the active ingestion audit and does not activate staged
 documents, preserving the prior active corpus. During activation, every SQL
-statement receives only the remaining budget; servers that expose PostgreSQL's
-`transaction_timeout` also bound the whole activation transaction. An expiry
-before completion rolls the transaction back before the replacement can publish.
+statement receives only the floored remaining budget and the whole transaction
+must be protected by PostgreSQL `transaction_timeout`. A server without that
+capability rejects activation before document mutation. Expiry before the final
+commit rolls back the replacement, and failure cleanup changes only a still-running
+audit rather than overwriting a completed, failed, or skipped result.
 
 Document ingestion uses Gemini's official ordered batch embedding endpoint and
 passes its remaining aggregate budget as the request timeout. A Gemini HTTP 429
-is retried at most once, only when its `Retry-After` delay fits inside that same
-remaining budget. It still records a failed audit and preserves the prior corpus
-when Gemini rejects a batch or the budget expires; a failed source must not be
-treated as idempotent success.
+is retried at most once, only when its finite numeric `Retry-After` delay fits
+inside a freshly measured remaining budget. It still records a failed audit and
+preserves the prior corpus when Gemini rejects a batch or the budget expires; a
+failed source must not be treated as idempotent success.
 
 `GET /health` returns `status` plus an `integrations` object. Each configured
 provider exposes configured versus ready state; `database`, `earth_engine`, and
@@ -202,6 +204,16 @@ rerun is claimed. The direct live audit remained 46 active chunks: PM-KISAN 38
 and Soil Health Card 8. Browser E2E is still unverified: supplied controller
 evidence says the current page rendered on 8013/3013, but CUA `setValue`/`fill`
 then click/Return left the form unchanged and emitted no backend request.
+
+In fix round 4, the configured PostgreSQL 18.6 server reported
+`transaction_timeout` support and accepted transaction-local parameterized
+statement and transaction timeout settings. Backend tests passed 128/128. A
+React Testing Library and `user-event` integration test typed and submitted a
+fertilizer query, verified the `/agent` payload, rendered the mocked grounded
+answer, and observed no added actionable quantity; the frontend suite passed
+2/2. This is application-path evidence, not a visible browser E2E pass. No new
+large-source ingestion was attempted because the prior bounded HTTP 429 evidence
+had not materially changed.
 
 ---
 
