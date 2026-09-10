@@ -35,3 +35,22 @@ contract, access controls, body caps, generic errors, withholding unsupported
 doses, waiting for worker completion on disconnect, fragmented UTF-8 frames,
 truncated streams, retained prior conversation and a non-responding GPS API.
 The production frontend build and mocked desktop/mobile browser checks passed.
+
+## Public Deployment Verification
+
+Both Render services are live on commit `0fe09a3`:
+
+- Backend deploy: `dep-dahf1mm743jc73cmujrg` (completed before frontend deployment).
+- Frontend deploy: `dep-dahf3d6k1f9s73fis860`.
+- GitHub Actions run `34511849590`: successful.
+
+One public PM-KISAN eligibility request received its first SSE byte in 0.437
+seconds and its final `kb`-backed answer in 8.176 seconds. Progress frames
+preceded the result. Browser CORS preflight passed; a streaming request with a
+farmer identity remained denied with 503 because service access is unconfigured.
+
+Public desktop (1440x900) and mobile (390x844) smoke tests at 18:08 UTC showed
+live processing status before answers, with no horizontal overflow or uncaught
+browser errors. Observed overall times were 11.513 and 8.420 seconds, including
+screenshots. These are two smoke observations, not a percentile or SLA.
+Progress and answer screenshots were visually reviewed.

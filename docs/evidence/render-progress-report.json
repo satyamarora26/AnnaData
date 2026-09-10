@@ -1,0 +1,23 @@
+{
+  "timestamp": "2026-09-10T18:08:34.896Z",
+  "results": [
+    {
+      "viewport": {
+        "width": 1440,
+        "height": 900
+      },
+      "mode": "live provider",
+      "answerReceived": true,
+      "elapsedMs": 11513
+    },
+    {
+      "viewport": {
+        "width": 390,
+        "height": 844
+      },
+      "mode": "live provider",
+      "answerReceived": true,
+      "elapsedMs": 8420
+    }
+  ]
+}
