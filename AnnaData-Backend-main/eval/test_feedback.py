@@ -6,8 +6,9 @@ that broke it could not be expressed in cases.yaml. A farmer was asked to rate,
 did so at 12:01, and was asked again at 12:02, because recording a rating
 cleared the same column that recorded when they were last asked.
 
-Run: python eval/test_feedback.py
+Run live assertions: FEEDBACK_EVAL_LIVE=1 python eval/test_feedback.py
 """
+import os
 import sys
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
@@ -16,7 +17,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 import db
 import feedback
-from config import FEEDBACK_COOLDOWN_DAYS
+from config import DATABASE_URL, FEEDBACK_COOLDOWN_DAYS
 
 USER = "+919999000001"          # reserved for this test, removed afterwards
 failures = []
@@ -35,6 +36,14 @@ def cleanup(conn):
 
 
 def main() -> int:
+    if os.getenv("FEEDBACK_EVAL_LIVE") != "1":
+        print("Feedback evaluator is live-only; set FEEDBACK_EVAL_LIVE=1 to run assertions.")
+        return 0
+
+    if not DATABASE_URL:
+        print("Feedback evaluator requires DATABASE_URL when FEEDBACK_EVAL_LIVE=1")
+        return 2
+
     if not db.init() or not feedback.init():
         print("Database unavailable; cannot run feedback tests")
         return 2

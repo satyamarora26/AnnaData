@@ -1,5 +1,6 @@
 import encoding_setup  # noqa: F401  (must be first)
 
+from contextlib import asynccontextmanager
 from typing import List, Optional
 
 from fastapi import FastAPI, UploadFile, File, HTTPException
@@ -18,7 +19,16 @@ import startup
 from Agent import run_agent
 from process_media import process_media
 
-app = FastAPI(title="Annadata Agent API")
+@asynccontextmanager
+async def lifespan(_app: FastAPI):
+    on_startup()
+    try:
+        yield
+    finally:
+        on_shutdown()
+
+
+app = FastAPI(title="Annadata Agent API", lifespan=lifespan)
 
 
 def _build_origins() -> list[str]:
@@ -45,7 +55,6 @@ app.add_middleware(
 )
 
 
-@app.on_event("startup")
 def on_startup():
     """Warm up optional subsystems without letting a failure block the service."""
     initializers = (
@@ -79,7 +88,6 @@ class QueryRequest(BaseModel):
     message_id: Optional[str] = None
 
 
-@app.on_event("shutdown")
 def on_shutdown():
     db.close()
 

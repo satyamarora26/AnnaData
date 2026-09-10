@@ -1,4 +1,8 @@
 from contextlib import contextmanager
+from pathlib import Path
+import os
+import subprocess
+import sys
 
 import app
 import db
@@ -21,9 +25,53 @@ def test_snapshot_distinguishes_configuration_from_runtime(monkeypatch):
     assert state["database"] == {
         "configured": True,
         "ready": False,
-        "status": "connection timed out",
+        "status": "unavailable",
     }
     assert state["knowledge"]["ready"] is False
+
+
+def test_snapshot_redacts_runtime_diagnostics(monkeypatch):
+    monkeypatch.setattr(readiness.config, "DATABASE_URL", "postgresql://configured")
+    monkeypatch.setattr(readiness.db, "is_available", lambda: False)
+    monkeypatch.setattr(
+        readiness.db,
+        "status",
+        lambda: "postgresql://farmer:secret@db.example/?token=hidden",
+    )
+    monkeypatch.setattr(readiness.config, "EE_SERVICE_KEY", "configured")
+    monkeypatch.setattr(readiness.startup, "is_available", lambda: False)
+    monkeypatch.setattr(
+        readiness.startup,
+        "status",
+        lambda: "https://earth.example/?key=secret",
+    )
+    monkeypatch.setattr(readiness.weather_tool, "is_available", lambda: False)
+    monkeypatch.setattr(
+        readiness.weather_tool,
+        "last_error",
+        lambda: "body={'access_token': 'secret'}",
+    )
+    monkeypatch.setattr(
+        readiness.knowledge,
+        "counts",
+        lambda: {"documents": 0, "pesticide_uses": 0},
+    )
+    monkeypatch.setattr(
+        readiness.knowledge,
+        "recent_ingestions",
+        lambda limit=5: [{"source": "token=secret", "status": "failed", "error": "token=secret"}],
+    )
+
+    state = readiness.snapshot()
+
+    assert state["database"]["status"] == "unavailable"
+    assert state["earth_engine"]["status"] == "unavailable"
+    assert state["weather"]["last_error"] == "unavailable"
+    assert state["knowledge"]["recent_ingestions"] == [
+        {"source": "redacted", "status": "failed", "error": None}
+    ]
+    assert "secret" not in repr(state)
+    assert "https://" not in repr(state)
 
 
 def test_startup_initializes_knowledge_after_database(monkeypatch):
@@ -105,3 +153,18 @@ def test_mandi_availability_reads_without_initializing_schema(monkeypatch):
     monkeypatch.setattr(db, "connection", database_connection)
     assert Mandi_Price_Tool.is_available() is True
     assert all("CREATE TABLE" not in query for query in connection.queries)
+
+
+def test_feedback_evaluator_is_offline_without_live_mode():
+    environment = os.environ.copy()
+    environment.pop("FEEDBACK_EVAL_LIVE", None)
+    result = subprocess.run(
+        [sys.executable, "eval/test_feedback.py"],
+        cwd=Path(__file__).resolve().parents[1],
+        env=environment,
+        text=True,
+        capture_output=True,
+        check=False,
+    )
+    assert result.returncode == 0
+    assert "live-only" in result.stdout
