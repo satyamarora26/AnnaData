@@ -1,5 +1,6 @@
 """Ingest only sources declared in the trusted source manifest."""
 import argparse
+import math
 from pathlib import Path
 import sys
 import time
@@ -132,8 +133,8 @@ def _parse_args() -> argparse.Namespace:
 
 def main() -> int:
     args = _parse_args()
-    if args.deadline_seconds <= 0:
-        print("--deadline-seconds must be positive", file=sys.stderr)
+    if not math.isfinite(args.deadline_seconds) or args.deadline_seconds <= 0:
+        print("--deadline-seconds must be a finite positive number", file=sys.stderr)
         return 2
     catalog = load_catalog(args.manifest)
     if args.all:

@@ -464,9 +464,14 @@ def _matches_dose_record(products: set[str], claims: set, periods: set[int], rec
 
 def _named_record_products(sentence: str, records: list[tuple[str, set, set]]) -> set[str]:
     normalized = _normalise_space(sentence)
+    safe_suffix = r"(?=\s*(?:$|\d|at\b|@|is\b|was\b|for\b|on\b|with\b|[,.;:!?]))"
     return {
         product for product, _, _ in records
-        if re.search(r"\b" + re.escape(product) + r"\b", normalized, re.I)
+        if re.search(
+            r"(?<!\w)" + re.escape(product) + r"(?!\w)" + safe_suffix,
+            normalized,
+            re.I,
+        )
     }
 
 

@@ -92,6 +92,15 @@ def test_ingestion_default_deadline_is_passed_into_chunking(tmp_path, monkeypatc
     assert isinstance(observed["deadline_at"], float)
 
 
+@pytest.mark.parametrize("deadline", [float("inf"), float("-inf"), float("nan")])
+def test_ingestion_rejects_non_finite_deadlines(tmp_path, deadline):
+    path = tmp_path / "guidance.txt"
+    path.write_text(_guidance_text(), encoding="utf-8")
+
+    with pytest.raises(ValueError, match="finite number"):
+        ingestion.ingest_source(_spec(), path, dry_run=True, deadline_seconds=deadline)
+
+
 def test_chunking_stops_when_aggregate_deadline_expires():
     text = ("First verified paragraph. " * 20) + "\n\n" + ("Second verified paragraph. " * 20)
     ticks = iter([0.0, 0.5, 1.0])
@@ -639,6 +648,18 @@ def test_cli_has_a_positive_default_deadline(monkeypatch):
     args = cli._parse_args()
 
     assert args.deadline_seconds > 0
+
+
+@pytest.mark.parametrize("deadline", ["inf", "-inf", "nan"])
+def test_cli_rejects_non_finite_deadline(monkeypatch, deadline):
+    cli = _cli_module()
+    monkeypatch.setattr(
+        sys,
+        "argv",
+        ["ingest_docs.py", "--source-id", "pm_kisan_guidelines", f"--deadline-seconds={deadline}"],
+    )
+
+    assert cli.main() == 2
 
 
 def test_cli_shares_one_deadline_across_sources(monkeypatch):

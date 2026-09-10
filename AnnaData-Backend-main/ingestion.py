@@ -1,6 +1,7 @@
 """Validated document extraction, chunking, and atomic knowledge ingestion."""
 from dataclasses import dataclass
 import hashlib
+import math
 from pathlib import Path
 import re
 import time
@@ -179,6 +180,11 @@ def ingest_source(
     dry_run: bool = False,
     deadline_seconds: float = DEFAULT_INGESTION_DEADLINE_SECONDS,
 ) -> IngestResult:
+    if not isinstance(deadline_seconds, (int, float)) or isinstance(deadline_seconds, bool):
+        raise ValueError("deadline_seconds must be a finite number")
+    deadline_seconds = float(deadline_seconds)
+    if not math.isfinite(deadline_seconds):
+        raise ValueError("deadline_seconds must be a finite number")
     started_at = time.monotonic()
     deadline_at = started_at + deadline_seconds
 
