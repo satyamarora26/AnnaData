@@ -27,6 +27,9 @@ class RecordingConnection:
         self.active_counts = (3, 3)
         self.audit_row = ("pm_kisan_guidelines", "abc123", "running", 0, 0, 0)
         self.transaction_timeout_setting = "0"
+        self.advisory_available = True
+        self.stale_run_ids = []
+        self.live_running = False
         self.errors = {}
 
     def execute(self, sql, params=()):
@@ -35,8 +38,16 @@ class RecordingConnection:
         for needle, error in self.errors.items():
             if needle in compact:
                 raise error
+        if "pg_try_advisory_xact_lock" in compact:
+            return Result((self.advisory_available,))
+        if "stale ingestion lease expired" in compact and "RETURNING id" in compact:
+            return Result(rows=[(run_id,) for run_id in self.stale_run_ids])
+        if "status = 'running'" in compact and "SELECT 1" in compact:
+            return Result((1,) if self.live_running else None)
         if "SELECT 1 FROM ingestion_runs" in compact:
             return Result(None)
+        if "SET heartbeat_at = now()" in compact and "RETURNING id" in compact:
+            return Result((params[0],))
         if "RETURNING id" in compact:
             return Result((41,))
         if "SELECT status FROM ingestion_runs" in compact:
@@ -58,6 +69,13 @@ class RecordingConnection:
         return Result()
 
     def commit(self):
+        self.timeout_at_commit = next(
+            (
+                params[0] for sql, params in reversed(self.calls)
+                if "set_config('statement_timeout'" in sql
+            ),
+            None,
+        )
         self.commits += 1
 
 
@@ -271,19 +289,17 @@ def test_activation_rejects_sub_millisecond_budget_without_rounding_up(monkeypat
     assert conn.commits == 0
 
 
-def test_activation_rejects_unsupported_transaction_timeout_before_mutation(monkeypatch):
+def test_activation_supports_postgresql_16_without_transaction_timeout(monkeypatch):
     conn = _recording_connection(monkeypatch)
     conn.transaction_timeout_setting = None
 
-    with pytest.raises(knowledge.ActivationDeadlineUnsupported):
-        knowledge.activate_documents(
-            41, _spec(), "abc123", 3, 3, 0,
-            deadline_at=10, clock=lambda: 0,
-        )
+    assert knowledge.activate_documents(
+        41, _spec(), "abc123", 3, 3, 0,
+        deadline_at=10, clock=lambda: 0,
+    )
 
-    assert not any("UPDATE documents" in sql for sql, _ in conn.calls)
-    assert not any("status = 'completed'" in sql for sql, _ in conn.calls)
-    assert conn.commits == 0
+    assert not any("transaction_timeout" in sql for sql, _ in conn.calls)
+    assert conn.commits == 1
 
 
 def test_activation_checks_deadline_after_final_statement_before_commit(monkeypatch):
@@ -309,17 +325,26 @@ def test_activation_checks_deadline_after_final_statement_before_commit(monkeypa
     assert conn.commits == 0
 
 
-def test_activation_uses_transaction_timeout_when_server_supports_it(monkeypatch):
-    conn = _recording_connection(monkeypatch)
-    conn.transaction_timeout_setting = "0"
+def test_activation_refreshes_remaining_statement_timeout_for_commit(monkeypatch):
+    now = [0.0]
+
+    class CommitBudgetConnection(RecordingConnection):
+        def execute(self, sql, params=()):
+            result = super().execute(sql, params)
+            if "SET status = 'completed'" in " ".join(sql.split()):
+                now[0] = 0.75
+            return result
+
+    conn = CommitBudgetConnection()
+    monkeypatch.setattr(knowledge.db, "is_available", lambda: True)
+    monkeypatch.setattr(knowledge.db, "connection", lambda: nullcontext(conn))
 
     assert knowledge.activate_documents(
         41, _spec(), "abc123", 3, 3, 0,
-        deadline_at=10, timeout_seconds=1, clock=lambda: 0,
+        deadline_at=1, clock=lambda: now[0],
     )
 
-    statements = [sql for sql, _ in conn.calls]
-    assert any("set_config('transaction_timeout'" in sql for sql in statements)
+    assert conn.timeout_at_commit == "250ms"
 
 
 def test_partial_stage_is_rejected_without_deactivating_current_corpus(monkeypatch):
@@ -506,6 +531,40 @@ def test_stage_document_keeps_new_chunks_inactive_until_activation(monkeypatch):
     assert params[0] == _spec().id
     assert params[8] == "abc123"
     assert params[9] == 41
+
+
+def test_stage_document_renews_source_lease_before_insert(monkeypatch):
+    conn = _recording_connection(monkeypatch)
+
+    assert knowledge.stage_document(41, _spec(), "abc123", "guidance", 0, [0.1])
+
+    statements = [sql for sql, _ in conn.calls]
+    heartbeat = next(i for i, sql in enumerate(statements) if "SET heartbeat_at = now()" in sql)
+    insert = next(i for i, sql in enumerate(statements) if "INSERT INTO documents" in sql)
+    assert heartbeat < insert
+
+
+def test_start_ingestion_recovers_stale_source_run_before_restaging(monkeypatch):
+    conn = _recording_connection(monkeypatch)
+    conn.stale_run_ids = [17]
+
+    assert knowledge.start_ingestion("document", _spec().id, _spec().source_url, "abc123") == 41
+
+    statements = [sql for sql, _ in conn.calls]
+    stale = next(i for i, sql in enumerate(statements) if "stale ingestion lease expired" in sql)
+    cleanup = next(i for i, sql in enumerate(statements) if "ingestion_run_id = ANY" in sql)
+    insert = next(i for i, sql in enumerate(statements) if "INSERT INTO ingestion_runs" in sql)
+    assert stale < cleanup < insert
+
+
+def test_start_ingestion_does_not_steal_fresh_source_run(monkeypatch):
+    conn = _recording_connection(monkeypatch)
+    conn.live_running = True
+
+    with pytest.raises(knowledge.IngestionLeaseActive, match="already running"):
+        knowledge.start_ingestion("document", _spec().id, _spec().source_url, "abc123")
+
+    assert not any("INSERT INTO ingestion_runs" in sql for sql, _ in conn.calls)
 
 
 def test_record_ingestion_failure_persists_terminal_audit_row(monkeypatch):

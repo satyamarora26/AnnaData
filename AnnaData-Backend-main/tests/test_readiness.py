@@ -9,6 +9,7 @@ import db
 import Mandi_Price_Tool
 import msp
 import readiness
+import weather_tool
 
 
 def test_snapshot_distinguishes_configuration_from_runtime(monkeypatch):
@@ -45,11 +46,15 @@ def test_snapshot_redacts_runtime_diagnostics(monkeypatch):
         "status",
         lambda: "https://earth.example/?key=secret",
     )
-    monkeypatch.setattr(readiness.weather_tool, "is_available", lambda: False)
     monkeypatch.setattr(
         readiness.weather_tool,
-        "last_error",
-        lambda: "body={'access_token': 'secret'}",
+        "status",
+        lambda: {
+            "state": "unavailable",
+            "provider": None,
+            "last_error": "body={'access_token': 'secret'}",
+            "last_successful_result": None,
+        },
     )
     monkeypatch.setattr(
         readiness.knowledge,
@@ -168,3 +173,123 @@ def test_feedback_evaluator_is_offline_without_live_mode():
     )
     assert result.returncode == 0
     assert "live-only" in result.stdout
+
+
+def _reset_weather_state(monkeypatch):
+    monkeypatch.setattr(weather_tool, "_availability_state", "unknown", raising=False)
+    monkeypatch.setattr(weather_tool, "_serving_provider", None, raising=False)
+    monkeypatch.setattr(weather_tool, "_last_error", None, raising=False)
+    monkeypatch.setattr(weather_tool, "_last_success_at", None, raising=False)
+    monkeypatch.setattr(weather_tool, "_last_success_provider", None, raising=False)
+    monkeypatch.setattr(weather_tool, "_last_successful_result", None, raising=False)
+    monkeypatch.setattr(weather_tool, "_cache", {})
+
+
+def test_weather_is_unknown_before_any_attempt(monkeypatch):
+    _reset_weather_state(monkeypatch)
+
+    assert weather_tool.status() == {
+        "state": "unknown",
+        "provider": None,
+        "last_error": None,
+        "last_successful_result": None,
+    }
+    assert weather_tool.is_available() is False
+
+
+def test_weather_fallback_success_is_degraded_and_clears_primary_error(monkeypatch):
+    _reset_weather_state(monkeypatch)
+    monkeypatch.setattr(
+        weather_tool,
+        "_fetch_weather",
+        lambda lat, lon: "Weather data unavailable (lookup failed).",
+    )
+    monkeypatch.setattr(weather_tool, "_last_error", "open_meteo_http_429")
+    monkeypatch.setattr(
+        weather_tool.weather_fallback,
+        "fetch",
+        lambda lat, lon: (
+            "Weather Report for (1, 2):\n"
+            "- Right now: temperature 24C\n"
+            "- Today's temp: 20-25C, Rain: 0 mm\n"
+        ),
+    )
+
+    report = weather_tool.weather_openmeteo(1, 2)
+    state = weather_tool.status()
+
+    assert report.startswith("Weather Report")
+    assert state["state"] == "degraded"
+    assert state["provider"] == "met-norway"
+    assert state["last_error"] is None
+    assert state["last_successful_result"]["provider"] == "met-norway"
+    assert weather_tool.is_available() is True
+
+
+def test_invalid_weather_response_is_unavailable_not_ready(monkeypatch):
+    _reset_weather_state(monkeypatch)
+
+    class Response:
+        def raise_for_status(self):
+            return None
+
+        def json(self):
+            return {"daily": {}}
+
+    monkeypatch.setattr(weather_tool.requests, "get", lambda *args, **kwargs: Response())
+    monkeypatch.setattr(weather_tool.weather_fallback, "fetch", lambda lat, lon: None)
+
+    report = weather_tool.weather_openmeteo(1, 2)
+    state = weather_tool.status()
+
+    assert report.startswith("Weather data unavailable")
+    assert state == {
+        "state": "unavailable",
+        "provider": None,
+        "last_error": "open_meteo_invalid_response",
+        "last_successful_result": None,
+    }
+    assert weather_tool.is_available() is False
+
+
+def test_malformed_weather_payload_falls_back_and_finishes_unavailable(monkeypatch):
+    _reset_weather_state(monkeypatch)
+
+    class Response:
+        def raise_for_status(self):
+            return None
+
+        def json(self):
+            return []
+
+    monkeypatch.setattr(weather_tool.requests, "get", lambda *args, **kwargs: Response())
+    monkeypatch.setattr(weather_tool.weather_fallback, "fetch", lambda lat, lon: None)
+
+    report = weather_tool.weather_openmeteo(1, 2)
+
+    assert report == "Weather data unavailable (unexpected response)."
+    assert weather_tool.status()["state"] == "unavailable"
+    assert weather_tool.status()["last_error"] == "open_meteo_invalid_response"
+
+
+def test_readiness_exposes_weather_state_without_raw_result(monkeypatch):
+    monkeypatch.setattr(
+        readiness.weather_tool,
+        "status",
+        lambda: {
+            "state": "degraded",
+            "provider": "met-norway",
+            "last_error": None,
+            "last_successful_result": {
+                "provider": "met-norway",
+                "at": "2026-09-10T12:00:00+00:00",
+            },
+        },
+    )
+
+    state = readiness.snapshot()["weather"]
+
+    assert state["ready"] is True
+    assert state["state"] == "degraded"
+    assert state["provider"] == "met-norway"
+    assert "Weather Report" not in repr(state)

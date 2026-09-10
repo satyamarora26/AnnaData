@@ -16,6 +16,7 @@ It is not a substitute for a local rate: a farmer often gets more than MSP, and
 for onion, potato and tomato there is no MSP at all. The wording says so.
 """
 import csv
+from dataclasses import dataclass
 import hashlib
 import io
 import re
@@ -29,6 +30,8 @@ from knowledge import canonical_crop
 SCHEMA = """
 CREATE TABLE IF NOT EXISTS commodity_msp (
     alias      TEXT NOT NULL,
+    commodity_id TEXT NOT NULL,
+    grade      TEXT NOT NULL DEFAULT '',
     label      TEXT NOT NULL,
     msp        NUMERIC NOT NULL,
     crop_group TEXT,
@@ -42,9 +45,14 @@ CREATE TABLE IF NOT EXISTS commodity_msp (
 ALTER TABLE commodity_msp ADD COLUMN IF NOT EXISTS source TEXT;
 ALTER TABLE commodity_msp ADD COLUMN IF NOT EXISTS source_url TEXT;
 ALTER TABLE commodity_msp ADD COLUMN IF NOT EXISTS content_hash TEXT;
+ALTER TABLE commodity_msp ADD COLUMN IF NOT EXISTS commodity_id TEXT;
+ALTER TABLE commodity_msp ADD COLUMN IF NOT EXISTS grade TEXT NOT NULL DEFAULT '';
+UPDATE commodity_msp SET commodity_id = lower(label) WHERE commodity_id IS NULL;
+ALTER TABLE commodity_msp ALTER COLUMN commodity_id SET NOT NULL;
 ALTER TABLE commodity_msp DROP CONSTRAINT IF EXISTS commodity_msp_pkey;
-CREATE UNIQUE INDEX IF NOT EXISTS commodity_msp_alias_year
-    ON commodity_msp (alias, year);
+DROP INDEX IF EXISTS commodity_msp_alias_year;
+CREATE UNIQUE INDEX IF NOT EXISTS commodity_msp_alias_identity_year
+    ON commodity_msp (alias, commodity_id, grade, year);
 """
 
 
@@ -60,6 +68,45 @@ def init() -> bool:
         return False
 
 
+@dataclass(frozen=True)
+class CommodityIdentity:
+    commodity_id: str
+    grade: str
+    aliases: tuple[str, ...]
+
+
+GRADE_QUALIFIERS = {
+    "whole", "common", "grade a", "hybrid", "maldandi", "yellow",
+    "medium staple", "long staple", "milling", "ball",
+}
+
+
+def commodity_identity(label: str) -> CommodityIdentity:
+    trailing = re.search(r"\(([^()]*)\)\s*$", label)
+    qualifier = trailing.group(1).strip().casefold() if trailing else ""
+    grade = qualifier if qualifier in GRADE_QUALIFIERS else ""
+    names_label = label[:trailing.start()].strip() if trailing and grade else label
+    parts = re.split(r"[/(),]", names_label)
+    names = set()
+    for part in parts:
+        name = " ".join(part.strip().casefold().split())
+        if not name or len(name) < 3:
+            continue
+        names.add(name)
+        canonical = canonical_crop(name)
+        if canonical:
+            names.add(canonical)
+
+    primary = " ".join(parts[0].strip().casefold().split()) if parts else label.casefold()
+    commodity_id = canonical_crop(primary) or primary
+    aliases = set(names)
+    if grade:
+        for name in names:
+            aliases.add(f"{name} {grade}")
+            aliases.add(f"{name} ({grade})")
+    return CommodityIdentity(commodity_id, grade, tuple(sorted(aliases)))
+
+
 def aliases_for(label: str) -> list[str]:
     """Every name a farmer might use for a commodity written as Agmarknet does.
 
@@ -69,18 +116,7 @@ def aliases_for(label: str) -> list[str]:
     than discarding. Qualifiers like "whole" and "common" are grades, not names,
     and would only produce false matches.
     """
-    QUALIFIERS = {"whole", "common", "grade", "seed", "fresh", "dry", "raw"}
-    parts = re.split(r"[/(),]", label)
-    names = set()
-    for part in parts:
-        name = part.strip().lower()
-        if not name or name in QUALIFIERS or len(name) < 3:
-            continue
-        names.add(name)
-        canonical = canonical_crop(name)
-        if canonical:
-            names.add(canonical)
-    return sorted(names)
+    return list(commodity_identity(label).aliases)
 
 
 def _parse_csv_bytes(content: bytes) -> list[tuple[str, str, float]]:
@@ -156,20 +192,24 @@ def replace_csv(path: str, year: str, source: str, source_url: str) -> dict:
         with db.connection() as conn:
             conn.execute("DELETE FROM commodity_msp WHERE year = %s", (year,))
             for group, label, value in rows:
-                for alias in aliases_for(label):
+                identity = commodity_identity(label)
+                for alias in identity.aliases:
                     conn.execute(
                         """
                         INSERT INTO commodity_msp
-                            (alias, label, msp, crop_group, year, source, source_url,
-                             content_hash)
-                        VALUES (%s, %s, %s, %s, %s, %s, %s, %s)
-                        ON CONFLICT (alias, year) DO UPDATE SET
+                            (alias, commodity_id, grade, label, msp, crop_group, year,
+                             source, source_url, content_hash)
+                        VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
+                        ON CONFLICT (alias, commodity_id, grade, year) DO UPDATE SET
                             label = EXCLUDED.label, msp = EXCLUDED.msp,
                             crop_group = EXCLUDED.crop_group, year = EXCLUDED.year,
                             source = EXCLUDED.source, source_url = EXCLUDED.source_url,
                             content_hash = EXCLUDED.content_hash, updated_at = now()
                         """,
-                        (alias, label, value, group, year, source, source_url, content_hash),
+                        (
+                            alias, identity.commodity_id, identity.grade, label, value,
+                            group, year, source, source_url, content_hash,
+                        ),
                     )
                     written += 1
             conn.execute(
@@ -201,29 +241,47 @@ def for_crop(crop: str | None) -> str:
     try:
         with db.connection() as conn:
             conn.execute(SCHEMA)
-            row = conn.execute(
-                """SELECT label, msp, year FROM commodity_msp WHERE alias = %s
-                   ORDER BY year DESC LIMIT 1""",
-                (crop.strip().lower(),),
-            ).fetchone()
-            if not row:
+            alias = " ".join(crop.strip().casefold().split())
+
+            def lookup(value: str) -> list[tuple]:
+                return conn.execute(
+                    """SELECT DISTINCT label, msp, year, commodity_id, grade
+                         FROM commodity_msp
+                        WHERE alias = %s
+                          AND year = (
+                              SELECT max(year) FROM commodity_msp WHERE alias = %s
+                          )
+                     ORDER BY label""",
+                    (value, value),
+                ).fetchall()
+
+            rows = lookup(alias)
+            if not rows:
                 canonical = canonical_crop(crop)
-                if canonical and canonical != crop.strip().lower():
-                    row = conn.execute(
-                        """SELECT label, msp, year FROM commodity_msp WHERE alias = %s
-                           ORDER BY year DESC LIMIT 1""",
-                        (canonical,),
-                    ).fetchone()
+                if canonical and canonical != alias:
+                    rows = lookup(canonical)
     except Exception as e:
         print(f"MSP lookup failed for {crop!r}: {e}")
         return ""
 
-    if not row:
+    if not rows:
         # Saying nothing is right here: many crops genuinely have no MSP, and
         # the answer should not imply the figure was looked up and missing.
         return ""
 
-    label, msp, year = row
+    if len(rows) > 1:
+        year = rows[0][2]
+        alternatives = "; ".join(
+            f"{label}: Rs {float(value):,.0f} per quintal"
+            for label, value, _, _, _ in rows
+        )
+        return (
+            f"Minimum Support Price alternatives for {crop.strip()} in {year}: "
+            f"{alternatives}. These rates depend on grade; identify the grade "
+            "before using one as the procurement floor."
+        )
+
+    label, msp, year, _, _ = rows[0]
     return (
         f"Minimum Support Price for {label} in {year}: Rs {float(msp):,.0f} per "
         f"quintal. This is the floor the government guarantees at a procurement "

@@ -3,6 +3,7 @@ import argparse
 from pathlib import Path
 import sys
 import time
+from urllib.parse import urljoin
 
 import requests
 
@@ -17,6 +18,9 @@ from source_catalog import SourceSpec, assert_trusted_url, load_catalog  # noqa:
 USER_AGENT = "AnnaData/1.0 (+https://github.com/satyamarora26/AnnaData)"
 GENERIC_CONTENT_TYPES = {"", "application/octet-stream"}
 DEFAULT_INGESTION_DEADLINE_SECONDS = 300
+FETCH_VALIDATION_DEADLINE_SECONDS = 120
+MAX_REDIRECTS = 5
+REDIRECT_STATUSES = {301, 302, 303, 307, 308}
 
 
 def _content_type_is_allowed(spec: SourceSpec, content_type: str) -> bool:
@@ -35,6 +39,34 @@ def _record_fetch_failure(spec: SourceSpec, error: Exception) -> None:
         print(f"Could not record fetch failure for {spec.id}: {audit_error}", file=sys.stderr)
 
 
+def _trusted_response(spec: SourceSpec):
+    current_url = spec.source_url
+    for redirects in range(MAX_REDIRECTS + 1):
+        assert_trusted_url(current_url)
+        response = requests.get(
+            current_url,
+            headers={"User-Agent": USER_AGENT},
+            timeout=(10, 120),
+            stream=True,
+            allow_redirects=False,
+        )
+        response_url = getattr(response, "url", None) or current_url
+        assert_trusted_url(response_url)
+        if getattr(response, "status_code", 200) not in REDIRECT_STATUSES:
+            response.raise_for_status()
+            return response
+        location = response.headers.get("Location")
+        if not location:
+            raise ValueError("redirect response did not provide a location")
+        target = urljoin(response_url, location)
+        assert_trusted_url(target)
+        close = getattr(response, "close", None)
+        if close:
+            close()
+        current_url = target
+    raise ValueError(f"source exceeded {MAX_REDIRECTS} redirects")
+
+
 def fetch_source(spec: SourceSpec) -> bool:
     """Fetch one HTTP source without replacing a valid local file prematurely."""
     if spec.fetch_mode != "http":
@@ -48,13 +80,7 @@ def fetch_source(spec: SourceSpec) -> bool:
     part = path.with_suffix(path.suffix + ".part")
     try:
         assert_trusted_url(spec.source_url)
-        response = requests.get(
-            spec.source_url,
-            headers={"User-Agent": USER_AGENT},
-            timeout=(10, 120),
-            stream=True,
-        )
-        response.raise_for_status()
+        response = _trusted_response(spec)
         if not _content_type_is_allowed(spec, response.headers.get("Content-Type", "")):
             raise ValueError("response content type does not match source extension")
 
@@ -69,6 +95,11 @@ def fetch_source(spec: SourceSpec) -> bool:
                     raise ValueError(f"download exceeds {ingestion.MAX_SOURCE_BYTES} bytes")
                 handle.write(block)
         ingestion.validate_source_file(part)
+        validation_deadline = time.monotonic() + FETCH_VALIDATION_DEADLINE_SECONDS
+        extracted = ingestion.clean_text(
+            ingestion.read_source(part, deadline_at=validation_deadline)
+        )
+        ingestion.validate_extracted_text(spec, extracted)
         part.replace(path)
         print(f"fetched {spec.id}: {path}")
         return True

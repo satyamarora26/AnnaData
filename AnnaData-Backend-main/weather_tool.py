@@ -9,7 +9,7 @@ import threading
 import time
 
 import requests
-from datetime import date, timedelta
+from datetime import date, datetime, timedelta, timezone
 
 import weather_fallback
 from config import (
@@ -27,19 +27,86 @@ _cache: dict[tuple, tuple] = {}
 _cache_lock = threading.Lock()
 _CACHE_MAX = 256
 
-# Last upstream failure, surfaced on /health. Weather can fail in the deployed
-# environment while working locally, and reading it back from the running
-# service beats trying to catch the line in a log.
+# Runtime state is observational only: /health reads it without probing either
+# provider. The successful report is retained internally, while status() emits
+# metadata only so provider text can never leak through readiness output.
+_status_lock = threading.Lock()
+_availability_state = "unknown"
+_serving_provider: str | None = None
 _last_error: str | None = None
+_last_success_at: str | None = None
+_last_success_provider: str | None = None
+_last_successful_result: str | None = None
+
+
+def _safe_error_code(value: str | None) -> str | None:
+    if value is None:
+        return None
+    if value.startswith("open_meteo_") and value.replace("_", "").isalnum():
+        return value
+    if value == "weather_providers_unavailable":
+        return value
+    return "weather_provider_error"
+
+
+def status() -> dict:
+    """Return provider-state metadata without exposing a weather report."""
+    with _status_lock:
+        last_success = None
+        if _last_successful_result is not None:
+            last_success = {
+                "provider": _last_success_provider,
+                "at": _last_success_at,
+            }
+        return {
+            "state": _availability_state,
+            "provider": _serving_provider,
+            "last_error": _safe_error_code(_last_error),
+            "last_successful_result": last_success,
+        }
 
 
 def last_error() -> str | None:
-    return _last_error
+    return status()["last_error"]
 
 
 def is_available() -> bool:
     """Whether the last recorded weather-provider state is usable."""
-    return _last_error is None
+    return status()["state"] in {"ready", "degraded"}
+
+
+def _is_valid_report(report: object) -> bool:
+    return (
+        isinstance(report, str)
+        and report.startswith("Weather Report for ")
+        and ("\n- Right now:" in report or "\n- Today's temp:" in report)
+    )
+
+
+def _record_success(provider: str, report: str) -> None:
+    global _availability_state, _serving_provider, _last_error
+    global _last_success_at, _last_success_provider, _last_successful_result
+    with _status_lock:
+        _availability_state = "ready" if provider == "open-meteo" else "degraded"
+        _serving_provider = provider
+        _last_error = None
+        _last_success_at = datetime.now(timezone.utc).isoformat(timespec="seconds")
+        _last_success_provider = provider
+        _last_successful_result = report
+
+
+def _record_unavailable(error_code: str | None) -> None:
+    global _availability_state, _serving_provider, _last_error
+    with _status_lock:
+        _availability_state = "unavailable"
+        _serving_provider = None
+        _last_error = _safe_error_code(error_code or "weather_providers_unavailable")
+
+
+def _set_primary_error(error_code: str) -> None:
+    global _last_error
+    with _status_lock:
+        _last_error = _safe_error_code(error_code)
 
 
 def _cache_key(lat, lon) -> tuple:
@@ -54,31 +121,41 @@ def weather_openmeteo(lat, lon) -> str:
     with _cache_lock:
         hit = _cache.get(key)
         if hit and now - hit[0] < WEATHER_CACHE_TTL:
+            provider = hit[2] if len(hit) > 2 else "open-meteo"
+            _record_success(provider, hit[1])
             return hit[1]
 
-    report = _fetch_weather(lat, lon)
+    try:
+        report = _fetch_weather(lat, lon)
+    except Exception:
+        _set_primary_error("open_meteo_invalid_response")
+        report = "Weather data unavailable (unexpected response)."
+    provider = "open-meteo"
 
     # Open-Meteo's limit is per IP and shared with everyone else on this host,
     # so being refused says nothing about our own usage and retrying will not
     # help. Fall back to a provider with its own quota.
-    if report.startswith("Weather data unavailable"):
+    if not _is_valid_report(report):
         fallback = weather_fallback.fetch(lat, lon)
-        if fallback:
+        if _is_valid_report(fallback):
             print(f"Weather served by fallback provider for ({lat}, {lon})")
             report = fallback
+            provider = "met-norway"
 
     # Never cache a failure - the next farmer deserves a fresh attempt.
-    if not report.startswith("Weather data unavailable"):
+    if _is_valid_report(report):
+        _record_success(provider, report)
         with _cache_lock:
             if len(_cache) >= _CACHE_MAX:
                 _cache.clear()
-            _cache[key] = (now, report)
+            _cache[key] = (now, report, provider)
+    else:
+        _record_unavailable(last_error())
 
     return report
 
 
 def _fetch_weather(lat, lon) -> str:
-    global _last_error
     today = date.today()
     start = today - timedelta(days=PAST_DAYS)
     end = today + timedelta(days=FORECAST_DAYS)
@@ -99,7 +176,6 @@ def _fetch_weather(lat, lon) -> str:
     }
 
     data = None
-    last_error = None
     for attempt in range(1, WEATHER_ATTEMPTS + 1):
         try:
             r = requests.get(
@@ -111,32 +187,31 @@ def _fetch_weather(lat, lon) -> str:
             data = r.json()
             break
         except Exception as e:
-            last_error = e
-            # Record the status so a rate limit is distinguishable from a
-            # block or a timeout without guessing.
+            # Retain a bounded diagnostic code only. Exception messages and
+            # response bodies can contain request details and are never logged.
             status = getattr(getattr(e, "response", None), "status_code", "-")
-            body = ""
-            resp = getattr(e, "response", None)
-            if resp is not None:
-                try:
-                    body = f" body={resp.text[:160]!r}"
-                except Exception:
-                    pass
-            _last_error = f"[http {status}] {type(e).__name__}: {e}{body}"
+            error_code = (
+                f"open_meteo_http_{status}"
+                if isinstance(status, int) or str(status).isdigit()
+                else f"open_meteo_{type(e).__name__.lower()}"
+            )
+            _set_primary_error(error_code)
             print(f"Weather attempt {attempt}/{WEATHER_ATTEMPTS} failed "
-                  f"for ({lat}, {lon}) {_last_error}")
+                  f"for ({lat}, {lon}) ({_safe_error_code(error_code)})")
             if attempt < WEATHER_ATTEMPTS:
                 time.sleep(attempt)
 
     if data is None:
-        print(f"Weather lookup failed for ({lat}, {lon}): {last_error}")
+        print(
+            f"Weather lookup failed for ({lat}, {lon}) "
+            f"after {WEATHER_ATTEMPTS} attempt(s)"
+        )
         return "Weather data unavailable (lookup failed)."
-
-    _last_error = None
 
     daily = data.get("daily")
     if not daily or not daily.get("time"):
-        return f"Weather data unavailable (unexpected response: {data})."
+        _set_primary_error("open_meteo_invalid_response")
+        return "Weather data unavailable (unexpected response)."
 
     times = daily["time"]
 
@@ -183,7 +258,7 @@ def _fetch_weather(lat, lon) -> str:
             now_parts.append(f"{label} {value}{unit}")
     now_block = f"- Right now: {', '.join(now_parts)}\n" if now_parts else ""
 
-    return (
+    report = (
         f"Weather Report for ({lat}, {lon}):\n"
         f"{now_block}"
         f"- Today's temp: {num(tmin, idx)}-{num(tmax, idx)}C, "
@@ -192,3 +267,7 @@ def _fetch_weather(lat, lon) -> str:
         f"- Last 1 month total rainfall: {last_30_sum:.2f} mm\n"
         f"- {len(forecast_lines)}-day Forecast:\n" + "\n".join(forecast_lines)
     )
+    if not _is_valid_report(report):
+        _set_primary_error("open_meteo_invalid_response")
+        return "Weather data unavailable (unexpected response)."
+    return report

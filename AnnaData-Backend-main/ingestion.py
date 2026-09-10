@@ -10,6 +10,7 @@ from source_catalog import SourceSpec
 
 
 MAX_SOURCE_BYTES = 80 * 1024 * 1024
+MAX_PDF_PAGES = 2000
 CHUNK_CHARS = 1000
 OVERLAP_CHARS = 150
 MIN_CHUNK_CHARS = 120
@@ -27,11 +28,19 @@ class IngestResult:
     rejected: int
 
 
-def sha256_file(path: Path) -> str:
+def _check_deadline(deadline_at: float | None, clock) -> None:
+    if deadline_at is not None and clock() >= deadline_at:
+        raise TimeoutError("extraction deadline exceeded")
+
+
+def sha256_file(path: Path, *, deadline_at: float | None = None, clock=None) -> str:
+    clock = clock or time.monotonic
     digest = hashlib.sha256()
     with path.open("rb") as handle:
         for block in iter(lambda: handle.read(1024 * 1024), b""):
+            _check_deadline(deadline_at, clock)
             digest.update(block)
+    _check_deadline(deadline_at, clock)
     return digest.hexdigest()
 
 
@@ -69,22 +78,36 @@ def validate_extracted_text(spec: SourceSpec, text: str) -> None:
             raise ValueError(f"required source term missing: {term}")
 
 
-def read_source(path: Path) -> str:
+def read_source(path: Path, *, deadline_at: float | None = None, clock=None) -> str:
+    clock = clock or time.monotonic
+    _check_deadline(deadline_at, clock)
     if _source_suffix(path) == ".pdf":
-        return read_pdf(path)
-    return read_html(path.read_text(encoding="utf-8", errors="replace"))
+        return read_pdf(path, deadline_at=deadline_at, clock=clock)
+    text = path.read_text(encoding="utf-8", errors="replace")
+    _check_deadline(deadline_at, clock)
+    result = read_html(text)
+    _check_deadline(deadline_at, clock)
+    return result
 
 
-def read_pdf(path: Path) -> str:
+def read_pdf(path: Path, *, deadline_at: float | None = None, clock=None) -> str:
     import pypdf
 
+    clock = clock or time.monotonic
+    _check_deadline(deadline_at, clock)
     reader = pypdf.PdfReader(str(path))
+    if len(reader.pages) > MAX_PDF_PAGES:
+        raise ValueError(f"PDF exceeds {MAX_PDF_PAGES} page extraction limit")
     pages = []
     for page in reader.pages:
+        _check_deadline(deadline_at, clock)
         try:
             pages.append(page.extract_text() or "")
+        except TimeoutError:
+            raise
         except Exception:
             continue
+        _check_deadline(deadline_at, clock)
     return "\n\n".join(pages)
 
 
@@ -146,16 +169,6 @@ def ingest_source(
     deadline_seconds: float | None = None,
 ) -> IngestResult:
     started_at = time.monotonic()
-    validate_source_file(path)
-    cleaned = clean_text(read_source(path))
-    validate_extracted_text(spec, cleaned)
-    content_hash = sha256_text(cleaned)
-    chunks = chunk_text(cleaned)
-    if not chunks:
-        raise ValueError(f"no usable text extracted from {path}")
-    if dry_run:
-        return IngestResult(spec.id, "dry-run", content_hash, len(chunks), 0, 0)
-
     deadline_at = None if deadline_seconds is None else started_at + deadline_seconds
 
     def remaining_seconds() -> float | None:
@@ -166,6 +179,40 @@ def ingest_source(
             raise TimeoutError("ingestion deadline exceeded")
         return remaining
 
+    source_hash = ""
+    try:
+        validate_source_file(path)
+        remaining_seconds()
+        source_hash = sha256_file(path, deadline_at=deadline_at)
+        cleaned = clean_text(read_source(path, deadline_at=deadline_at))
+        remaining_seconds()
+        validate_extracted_text(spec, cleaned)
+        content_hash = sha256_text(cleaned)
+        chunks = chunk_text(cleaned)
+        remaining_seconds()
+        if not chunks:
+            raise ValueError(f"no usable text extracted from {path}")
+    except (Exception, KeyboardInterrupt) as exc:
+        error = (
+            "extraction deadline exceeded"
+            if isinstance(exc, TimeoutError)
+            else "ingestion interrupted"
+            if isinstance(exc, KeyboardInterrupt)
+            else str(exc)
+        )
+        if not dry_run:
+            try:
+                knowledge.record_ingestion_failure(
+                    "document", spec.id, spec.source_url, error, source_hash or None
+                )
+            except Exception as audit_exc:
+                print(f"Could not record extraction failure: {audit_exc}")
+        return IngestResult(spec.id, "failed", source_hash, 0, 0, 0)
+
+    if dry_run:
+        return IngestResult(spec.id, "dry-run", content_hash, len(chunks), 0, 0)
+
+    remaining_seconds()
     run_id = knowledge.start_ingestion("document", spec.id, spec.source_url, content_hash)
     if run_id is None:
         return IngestResult(spec.id, "skipped", content_hash, len(chunks), 0, 0)
@@ -175,8 +222,17 @@ def ingest_source(
     try:
         for offset in range(0, len(chunks), EMBED_BATCH_SIZE):
             batch = chunks[offset:offset + EMBED_BATCH_SIZE]
+            if not knowledge.renew_ingestion_lease(run_id, spec.id):
+                raise knowledge.IngestionLeaseActive(
+                    f"ingestion lease is no longer active for {spec.id}"
+                )
+            embedding_timeout = remaining_seconds() or 60
+            embedding_timeout = min(
+                embedding_timeout,
+                max(1.0, knowledge.INGESTION_LEASE_SECONDS / 2),
+            )
             vectors = knowledge.embed_batch(
-                batch, timeout_seconds=remaining_seconds() or 60
+                batch, timeout_seconds=embedding_timeout
             )
             remaining_seconds()
             if vectors is None or len(vectors) != len(batch):

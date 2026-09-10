@@ -1280,6 +1280,36 @@ Scheduling is driven by an external cron hitting an endpoint rather than a
 timer inside the process, because free hosting sleeps and a background loop
 would simply stop. The same ping also wakes the service.
 
+### Final verified-data hardening (2026-09-10)
+
+The final review exposed one deployment mismatch in the earlier activation
+design: the binding database target is PostgreSQL 16, which has
+`statement_timeout` but not `transaction_timeout`. Activation now refreshes the
+aggregate remaining `statement_timeout` before every command and immediately
+before `COMMIT`. This bounds normal server-side work on PostgreSQL 16, but it
+does not make an in-flight commit externally knowable after a connection loss.
+The completed audit and active corpus commit atomically; that audit is the
+reconciliation record. This paragraph supersedes the PostgreSQL 18-only
+requirement described in Task 8 fix round 4.
+
+Document runs now carry a source-scoped 300-second heartbeat lease. Expired
+staging is failed and cleaned under an advisory transaction lock, fresh work is
+not stolen, and embedding calls are capped below the lease interval. Extraction
+shares the operation deadline from its first validation step and records a
+terminal pre-staging failure when storage is reachable.
+
+The six CIB&RC artifacts are now an indivisible reviewed set. Their official
+URLs, categories, dates, and observed SHA-256 values live in the tracked
+manifest; fetch publishes only a complete hash-matching directory, and load
+publishes all categories and audits in one transaction. MSP aliases retain a
+stable commodity and grade, so an unqualified graded crop returns every current
+alternative instead of whichever row happened to overwrite the alias.
+
+Weather readiness is no longer inferred from the absence of an error. It starts
+unknown, records the final serving provider, distinguishes primary readiness
+from degraded fallback service, and exposes only bounded error codes and
+last-success metadata through health output.
+
 ---
 
 ## 7. Testing

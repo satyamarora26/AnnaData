@@ -27,6 +27,20 @@ def _cli_module():
     return module
 
 
+def _trust_extracted_identity(monkeypatch, cli):
+    monkeypatch.setattr(cli.ingestion, "read_source", lambda *args, **kwargs: _guidance_text())
+
+
+@pytest.fixture(autouse=True)
+def _successful_lease_renewal(monkeypatch):
+    monkeypatch.setattr(
+        ingestion.knowledge,
+        "renew_ingestion_lease",
+        lambda run_id, source: True,
+        raising=False,
+    )
+
+
 def test_pdf_signature_is_required(tmp_path):
     path = tmp_path / "fake.pdf"
     path.write_text("<html>blocked</html>", encoding="utf-8")
@@ -149,11 +163,75 @@ def test_interrupted_embedding_rolls_back_the_audit(tmp_path, monkeypatch):
     assert failures == [(18, "ingestion interrupted", result.parsed, 0, result.parsed)]
 
 
-def test_ingestion_deadline_rolls_back_without_activation(tmp_path, monkeypatch):
+def test_pdf_extraction_stops_between_pages_when_deadline_expires(tmp_path, monkeypatch):
+    path = tmp_path / "guidance.pdf"
+    path.write_bytes(b"%PDF-fixture")
+    extracted = []
+
+    class Page:
+        def __init__(self, name):
+            self.name = name
+
+        def extract_text(self):
+            extracted.append(self.name)
+            return self.name
+
+    class Reader:
+        def __init__(self, _path):
+            self.pages = [Page("first"), Page("second")]
+
+    monkeypatch.setitem(sys.modules, "pypdf", SimpleNamespace(PdfReader=Reader))
+    clock = iter((0.0, 0.0, 2.0))
+
+    with pytest.raises(TimeoutError, match="extraction"):
+        ingestion.read_pdf(path, deadline_at=1.0, clock=lambda: next(clock))
+
+    assert extracted == ["first"]
+
+
+def test_extraction_deadline_records_terminal_audit_before_staging(tmp_path, monkeypatch):
+    path = tmp_path / "guidance.txt"
+    path.write_text(_guidance_text(), encoding="utf-8")
+    audits = []
+    monkeypatch.setattr(
+        ingestion,
+        "read_source",
+        lambda *args, **kwargs: (_ for _ in ()).throw(TimeoutError("extraction deadline exceeded")),
+    )
+    monkeypatch.setattr(
+        ingestion.knowledge,
+        "record_ingestion_failure",
+        lambda *args: audits.append(args),
+    )
+    monkeypatch.setattr(
+        ingestion.knowledge,
+        "start_ingestion",
+        lambda *args: pytest.fail("failed extraction must not start a running audit"),
+    )
+
+    result = ingestion.ingest_source(_spec(), path, deadline_seconds=1)
+
+    assert result.status == "failed"
+    assert result.parsed == result.stored == result.rejected == 0
+    assert audits and audits[0][:3] == (
+        "document", _spec().id, _spec().source_url,
+    )
+    assert audits[0][3] == "extraction deadline exceeded"
+
+
+def test_zero_ingestion_deadline_records_failure_before_running_audit(tmp_path, monkeypatch):
     path = tmp_path / "guidance.txt"
     path.write_text(_guidance_text(), encoding="utf-8")
     failures = []
-    monkeypatch.setattr(ingestion.knowledge, "start_ingestion", lambda *args: "run-deadline")
+    audits = []
+    monkeypatch.setattr(
+        ingestion.knowledge,
+        "start_ingestion",
+        lambda *args: pytest.fail("expired extraction must not start a running audit"),
+    )
+    monkeypatch.setattr(
+        ingestion.knowledge, "record_ingestion_failure", lambda *args: audits.append(args)
+    )
     monkeypatch.setattr(
         ingestion.knowledge,
         "embed_batch",
@@ -169,20 +247,23 @@ def test_ingestion_deadline_rolls_back_without_activation(tmp_path, monkeypatch)
     result = ingestion.ingest_source(_spec(), path, deadline_seconds=0)
 
     assert result.status == "failed"
-    assert failures == [(
-        "run-deadline", "ingestion deadline exceeded", result.parsed, 0, result.parsed
-    )]
+    assert failures == []
+    assert audits and audits[0][3] == "extraction deadline exceeded"
 
 
 def test_deadline_before_staging_rolls_back_without_activation(tmp_path, monkeypatch):
     path = tmp_path / "guidance.txt"
     path.write_text(_guidance_text(), encoding="utf-8")
     failures = []
-    clock = iter((0, 0, 0, 1))
+    now = [0.0]
     monkeypatch.setattr(ingestion, "chunk_text", lambda text: [text])
-    monkeypatch.setattr(ingestion.time, "monotonic", lambda: next(clock))
+    monkeypatch.setattr(ingestion.time, "monotonic", lambda: now[0])
     monkeypatch.setattr(ingestion.knowledge, "start_ingestion", lambda *args: 21)
-    monkeypatch.setattr(ingestion.knowledge, "embed_batch", lambda texts, **kwargs: [[0.0] * 768])
+    def embed_batch(texts, **kwargs):
+        now[0] = 1.0
+        return [[0.0] * 768]
+
+    monkeypatch.setattr(ingestion.knowledge, "embed_batch", embed_batch)
     monkeypatch.setattr(ingestion.knowledge, "stage_document", lambda *args: pytest.fail("must not stage"))
     monkeypatch.setattr(ingestion.knowledge, "activate_documents", lambda *args: pytest.fail("must not activate"))
     monkeypatch.setattr(ingestion.knowledge, "fail_ingestion", lambda *args: failures.append(args))
@@ -193,16 +274,49 @@ def test_deadline_before_staging_rolls_back_without_activation(tmp_path, monkeyp
     assert failures == [(21, "ingestion deadline exceeded", 1, 0, 1)]
 
 
+def test_ingestion_renews_lease_before_bounded_embedding(tmp_path, monkeypatch):
+    path = tmp_path / "guidance.txt"
+    path.write_text(_guidance_text(), encoding="utf-8")
+    events = []
+    monkeypatch.setattr(ingestion, "chunk_text", lambda text: [text])
+    monkeypatch.setattr(ingestion.knowledge, "start_ingestion", lambda *args: 23)
+    monkeypatch.setattr(
+        ingestion.knowledge,
+        "renew_ingestion_lease",
+        lambda run_id, source: events.append(("heartbeat", run_id, source)) or True,
+        raising=False,
+    )
+
+    def embed_batch(texts, **kwargs):
+        events.append(("embed", kwargs["timeout_seconds"]))
+        return [[0.0] * 768]
+
+    monkeypatch.setattr(ingestion.knowledge, "embed_batch", embed_batch)
+    monkeypatch.setattr(ingestion.knowledge, "stage_document", lambda *args: True)
+    monkeypatch.setattr(ingestion.knowledge, "activate_documents", lambda *args, **kwargs: True)
+
+    result = ingestion.ingest_source(_spec(), path, deadline_seconds=600)
+
+    assert result.status == "completed"
+    assert events[0] == ("heartbeat", 23, _spec().id)
+    assert events[1][0] == "embed"
+    assert events[1][1] <= ingestion.knowledge.INGESTION_LEASE_SECONDS / 2
+
+
 def test_deadline_before_activation_rolls_back_after_staging(tmp_path, monkeypatch):
     path = tmp_path / "guidance.txt"
     path.write_text(_guidance_text(), encoding="utf-8")
     failures = []
-    clock = iter((0, 0, 0, 0, 0, 1))
+    now = [0.0]
     monkeypatch.setattr(ingestion, "chunk_text", lambda text: [text])
-    monkeypatch.setattr(ingestion.time, "monotonic", lambda: next(clock))
+    monkeypatch.setattr(ingestion.time, "monotonic", lambda: now[0])
     monkeypatch.setattr(ingestion.knowledge, "start_ingestion", lambda *args: 22)
     monkeypatch.setattr(ingestion.knowledge, "embed_batch", lambda texts, **kwargs: [[0.0] * 768])
-    monkeypatch.setattr(ingestion.knowledge, "stage_document", lambda *args: True)
+    def stage_document(*args):
+        now[0] = 1.0
+        return True
+
+    monkeypatch.setattr(ingestion.knowledge, "stage_document", stage_document)
     monkeypatch.setattr(ingestion.knowledge, "activate_documents", lambda *args: pytest.fail("must not activate"))
     monkeypatch.setattr(ingestion.knowledge, "fail_ingestion", lambda *args: failures.append(args))
 
@@ -303,6 +417,7 @@ def test_fetch_uses_bounded_request_and_replaces_after_validation(tmp_path, monk
         return Response()
 
     monkeypatch.setattr(cli.requests, "get", request)
+    _trust_extracted_identity(monkeypatch, cli)
 
     assert cli.fetch_source(spec)
     assert path.read_bytes() == b"%PDF-new"
@@ -311,6 +426,7 @@ def test_fetch_uses_bounded_request_and_replaces_after_validation(tmp_path, monk
         "headers": {"User-Agent": "AnnaData/1.0 (+https://github.com/satyamarora26/AnnaData)"},
         "timeout": (10, 120),
         "stream": True,
+        "allow_redirects": False,
     }
 
 
@@ -331,6 +447,7 @@ def test_fetch_accepts_a_pdf_exactly_at_the_byte_limit(tmp_path, monkeypatch):
             yield b"%PDF-123"
 
     monkeypatch.setattr(cli.requests, "get", lambda *args, **kwargs: Response())
+    _trust_extracted_identity(monkeypatch, cli)
 
     assert cli.fetch_source(spec)
     assert path.read_bytes() == b"%PDF-123"
@@ -375,6 +492,7 @@ def test_fetch_accepts_generic_octet_stream_after_pdf_signature_validation(tmp_p
             yield b"%PDF-verified"
 
     monkeypatch.setattr(cli.requests, "get", lambda *args, **kwargs: Response())
+    _trust_extracted_identity(monkeypatch, cli)
 
     assert cli.fetch_source(spec)
     assert path.read_bytes() == b"%PDF-verified"
@@ -409,6 +527,60 @@ def test_fetch_refuses_non_http_modes(tmp_path, monkeypatch):
     monkeypatch.setattr(cli.requests, "get", lambda *args, **kwargs: pytest.fail("only http may fetch"))
 
     assert not cli.fetch_source(spec)
+
+
+def test_fetch_rejects_untrusted_redirect_before_following_it(tmp_path, monkeypatch):
+    cli = _cli_module()
+    spec = _spec()
+    path = tmp_path / "pm-kisan.pdf"
+    path.write_bytes(b"%PDF-old")
+    spec = spec.__class__(**{**spec.__dict__, "local_path": path})
+    calls = []
+
+    class Response:
+        status_code = 302
+        headers = {"Location": "https://example.com/replacement.pdf"}
+
+        def raise_for_status(self):
+            return None
+
+    def request(url, **kwargs):
+        calls.append((url, kwargs.get("allow_redirects")))
+        return Response()
+
+    monkeypatch.setattr(cli.requests, "get", request)
+
+    assert not cli.fetch_source(spec)
+    assert calls == [(spec.source_url, False)]
+    assert path.read_bytes() == b"%PDF-old"
+
+
+def test_fetch_rejects_wrong_extracted_identity_before_replacement(tmp_path, monkeypatch):
+    cli = _cli_module()
+    spec = _spec()
+    path = tmp_path / "pm-kisan.pdf"
+    path.write_bytes(b"%PDF-old")
+    spec = spec.__class__(**{**spec.__dict__, "local_path": path})
+
+    class Response:
+        status_code = 200
+        headers = {"Content-Type": "application/pdf"}
+
+        def raise_for_status(self):
+            return None
+
+        def iter_content(self, chunk_size):
+            yield b"%PDF-new"
+
+    monkeypatch.setattr(cli.requests, "get", lambda *args, **kwargs: Response())
+    monkeypatch.setattr(
+        cli.ingestion,
+        "read_source",
+        lambda *args, **kwargs: "unrelated official-looking material " * 30,
+    )
+
+    assert not cli.fetch_source(spec)
+    assert path.read_bytes() == b"%PDF-old"
 
 
 def test_dry_run_does_not_initialize_the_database(tmp_path, monkeypatch):

@@ -21,7 +21,7 @@ query ──▶ rewrite as standalone (using history)
 | `Query_Parser.py` | Extracts location, state, crop | Gemini |
 | `Address_Convertor.py` | Place name → coordinates | `LOCATION_API_KEY` |
 | `Soil_Tool.py` | Texture, pH, organic carbon | `EE_SERVICE_KEY` |
-| `weather_tool.py` | 30 days history + 7 day forecast | nothing (Open-Meteo) |
+| `weather_tool.py` | 30 days history + 7 day forecast, with a reduced fallback | nothing (Open-Meteo / MET Norway) |
 | `Mandi_Price_Tool.py` | Market prices by state and commodity | `GOV_API_KEY` |
 | `Web_Crawler.py` | Govt schemes / cold storage | AWS Bedrock |
 | `Agent.py` | Orchestrates all of the above | — |
@@ -69,4 +69,5 @@ curl -X POST http://127.0.0.1:8000/agent \
 - `history` is `[{"role": "user"|"assistant", "content": "..."}]`.
 - CORS allows `localhost:3000` plus `FRONTEND_URL` and anything in `CORS_ORIGINS`.
 - `MANDI_MAX_RECORDS` caps how many market rows enter the prompt. Raising it increases latency and token cost noticeably.
+- Weather health starts as `unknown`, becomes `ready` on a valid Open-Meteo result, `degraded` on a valid MET Norway fallback, and `unavailable` only after both paths fail.
 - There is no authentication or rate limiting on `/agent`. Add one before making the URL public.

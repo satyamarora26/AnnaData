@@ -10,22 +10,23 @@ dose AnnaData quotes can be checked rather than merely sounding right.
 """
 import argparse
 from pathlib import Path
+import shutil
+import sys
+import tempfile
 
 import requests
+
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
+
+from cibrc_catalog import load_catalog, verified_artifacts
 
 BASE = "https://ppqs.gov.in"
 SOURCE_PAGE = f"{BASE}/divisions/cib-rc/major-uses-of-pesticides"
 AS_ON = "31.03.2026"
 
 # Keyed by the pesticide category, since that is what the table records.
-FILES = {
-    "insecticide":  "/sites/default/files/updated_mup_insecticide_as_on_31.03.2026_c.pdf",
-    "fungicide":    "/sites/default/files/2._chemical_mup_fungicide_as_on_31.03.2026_0.pdf",
-    "biofungicide": "/sites/default/files/3._bio_pesticide_mup_biofungicide_as_on_31.03.2026.pdf",
-    "herbicide":    "/sites/default/files/4._herbicides_mup_as_on_31.03.2026.pdf",
-    "pgr":          "/sites/default/files/5._pgr_mup_as_on_31.03.2026.pdf",
-    "bioinsecticide": "/sites/default/files/6._mup_bio_insecticide_31.03.2026.pdf",
-}
+CATALOG = load_catalog()
+FILES = {category: artifact.source_url for category, artifact in CATALOG.items()}
 
 UA = (
     "Mozilla/5.0 (compatible; AnnaData/1.0 agricultural advisory; "
@@ -73,21 +74,46 @@ def _parse_args(argv: list[str] | None = None) -> argparse.Namespace:
 def main(argv: list[str] | None = None) -> int:
     args = _parse_args(argv)
     out = args.out
-    out.mkdir(parents=True, exist_ok=True)
+    out.parent.mkdir(parents=True, exist_ok=True)
+    staged = Path(tempfile.mkdtemp(prefix=f".{out.name}-staged-", dir=out.parent))
 
     print(f"Source: {SOURCE_PAGE}  (as on {AS_ON})")
     ok = 0
-    for category, path in FILES.items():
-        target = out / f"{category}.pdf"
-        try:
-            size = download_file(BASE + path, target, args.timeout)
-            print(f"  {category:15} {size / 1e6:5.1f} MB -> {target}")
-            ok += 1
-        except Exception as e:
-            print(f"  {category:15} FAILED: {e}")
+    try:
+        for category, artifact in CATALOG.items():
+            target = staged / artifact.filename
+            try:
+                size = download_file(artifact.source_url, target, args.timeout)
+                print(f"  {category:15} {size / 1e6:5.1f} MB -> {out / artifact.filename}")
+                ok += 1
+            except Exception as e:
+                print(f"  {category:15} FAILED: {e}")
 
-    print(f"\n{ok}/{len(FILES)} downloaded into {out}")
-    return 0 if ok else 1
+        print(f"\n{ok}/{len(CATALOG)} downloaded for {out}")
+        if ok != len(CATALOG):
+            return 1
+        verified_artifacts(staged, CATALOG)
+
+        backup = None
+        if out.exists():
+            backup = Path(tempfile.mkdtemp(prefix=f".{out.name}-backup-", dir=out.parent))
+            backup.rmdir()
+            out.replace(backup)
+        try:
+            staged.replace(out)
+        except Exception:
+            if backup is not None and not out.exists():
+                backup.replace(out)
+            raise
+        if backup is not None:
+            shutil.rmtree(backup)
+        return 0
+    except Exception as exc:
+        print(f"CIB&RC fetch set rejected: {exc}")
+        return 1
+    finally:
+        if staged.exists():
+            shutil.rmtree(staged)
 
 
 if __name__ == "__main__":

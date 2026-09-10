@@ -38,7 +38,10 @@ def fetch(lat, lon) -> str | None:
         response.raise_for_status()
         series = response.json()["properties"]["timeseries"]
     except Exception as e:
-        print(f"Fallback weather failed for ({lat}, {lon}): {e}")
+        print(
+            f"Fallback weather failed for ({lat}, {lon}) "
+            f"({type(e).__name__})"
+        )
         return None
 
     if not series:

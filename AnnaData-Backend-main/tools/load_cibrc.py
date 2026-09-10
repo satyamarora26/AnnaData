@@ -21,7 +21,6 @@ on their field.
     python tools/load_cibrc.py --dry-run  # parse and report, write nothing
 """
 import argparse
-import hashlib
 import re
 import sys
 from pathlib import Path
@@ -32,6 +31,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 import db  # noqa: E402
 import knowledge  # noqa: E402
+from cibrc_catalog import CibrcArtifact, REQUIRED_CATEGORIES, verified_artifacts  # noqa: E402
 
 SOURCE_URL = "https://ppqs.gov.in/divisions/cib-rc/major-uses-of-pesticides"
 AS_ON = "31.03.2026"
@@ -109,9 +109,10 @@ def looks_like_product(first: str, rest: list[str]) -> bool:
     return bool(re.match(r"^[A-Za-z]", first))
 
 
-def parse_pdf(path: Path, category: str) -> list[dict]:
+def parse_pdf(path: Path, category: str, *, source_url: str = SOURCE_URL,
+              as_on: str = AS_ON) -> list[dict]:
     label = CATEGORY_LABEL.get(category, category)
-    source = f"CIB&RC Major Uses of Pesticides ({label}), as on {AS_ON}"
+    source = f"CIB&RC Major Uses of Pesticides ({label}), as on {as_on}"
 
     uses: list[dict] = []
     product = None
@@ -161,7 +162,7 @@ def parse_pdf(path: Path, category: str) -> list[dict]:
                         "dilution": dilution or None,
                         "waiting_period": valid_waiting_period(waiting),
                         "source": source,
-                        "source_url": SOURCE_URL,
+                        "source_url": source_url,
                     })
 
     print(f"  {category:15} {len(uses):5} uses parsed, {skipped} rows skipped")
@@ -184,14 +185,6 @@ INSERT_SQL = """
         source_url = EXCLUDED.source_url
 """
 
-def sha256_file(path: Path) -> str:
-    digest = hashlib.sha256()
-    with path.open("rb") as fh:
-        for chunk in iter(lambda: fh.read(1024 * 1024), b""):
-            digest.update(chunk)
-    return digest.hexdigest()
-
-
 def replace_category(category: str, uses: list[dict], run_id: int) -> int:
     """Replace one fully parsed statutory category in a single transaction."""
     if not uses:
@@ -206,6 +199,52 @@ def replace_category(category: str, uses: list[dict], run_id: int) -> int:
             (len(uses), len(uses), run_id),
         )
     return len(uses)
+
+
+def review_artifacts(folder: Path) -> list[tuple[CibrcArtifact, list[dict]]]:
+    reviewed = []
+    for artifact, path in verified_artifacts(folder):
+        uses = parse_pdf(
+            path,
+            artifact.category,
+            source_url=artifact.source_url,
+            as_on=artifact.as_on,
+        )
+        if not uses:
+            raise ValueError(f"no safe CIB&RC rows parsed for {artifact.category}")
+        reviewed.append((artifact, uses))
+    return reviewed
+
+
+def replace_all_categories(
+    reviewed: list[tuple[CibrcArtifact, list[dict]]], run_ids: dict[str, int]
+) -> int:
+    """Replace the complete verified register set in one transaction."""
+    categories = [artifact.category for artifact, _ in reviewed]
+    if (
+        len(categories) != len(REQUIRED_CATEGORIES)
+        or set(categories) != REQUIRED_CATEGORIES
+        or set(run_ids) != REQUIRED_CATEGORIES
+        or any(not uses for _, uses in reviewed)
+    ):
+        raise ValueError("CIB&RC replacement requires the complete six-category set")
+    total = 0
+    with db.connection() as conn:
+        with conn.cursor() as cursor:
+            for artifact, uses in reviewed:
+                conn.execute(
+                    "DELETE FROM pesticide_uses WHERE category = %s",
+                    (artifact.category,),
+                )
+                cursor.executemany(INSERT_SQL, uses)
+                total += len(uses)
+        for artifact, uses in reviewed:
+            conn.execute(
+                """UPDATE ingestion_runs SET status = 'completed', parsed_count = %s,
+                      stored_count = %s, completed_at = now() WHERE id = %s""",
+                (len(uses), len(uses), run_ids[artifact.category]),
+            )
+    return total
 
 
 def _parse_args(argv: list[str] | None = None) -> argparse.Namespace:
@@ -223,19 +262,12 @@ def main(argv: list[str] | None = None) -> int:
         print("data/cibrc not found - run tools/fetch_cibrc.py first")
         return 1
 
-    total = 0
-    reviewed = []
-    for pdf in sorted(folder.glob("*.pdf")):
-        content_hash = sha256_file(pdf)
-        category = pdf.stem
-        try:
-            uses = parse_pdf(pdf, category)
-        except Exception as exc:
-            print(f"  {category:15} FAILED: {exc}")
-            reviewed.append((category, content_hash, None, exc))
-            continue
-        total += len(uses)
-        reviewed.append((category, content_hash, uses, None))
+    try:
+        reviewed = review_artifacts(folder)
+    except Exception as exc:
+        print(f"CIB&RC artifact set rejected: {exc}")
+        return 1
+    total = sum(len(uses) for _, uses in reviewed)
 
     print(f"\n{total} approved uses parsed from {folder}")
     if dry:
@@ -246,26 +278,30 @@ def main(argv: list[str] | None = None) -> int:
         print("No database. Set DATABASE_URL.")
         return 1
     knowledge.init()
-    for category, content_hash, uses, parse_error in reviewed:
-        source = f"cibrc:{category}"
-        if parse_error:
-            knowledge.record_ingestion_failure(
-                "cibrc", source, SOURCE_URL, f"PDF parsing failed: {parse_error}", content_hash
+    run_ids = {}
+    try:
+        for artifact, _ in reviewed:
+            source = f"cibrc:{artifact.category}"
+            run_id = knowledge.start_ingestion(
+                "cibrc", source, artifact.source_url, artifact.sha256, skip_completed=False
             )
-            continue
-        if not uses:
-            knowledge.record_ingestion_failure(
-                "cibrc", source, SOURCE_URL, "no safe CIB&RC rows parsed", content_hash
-            )
-            continue
-        run_id = knowledge.start_ingestion(
-            "cibrc", source, SOURCE_URL, content_hash, skip_completed=False
-        )
-        try:
-            replace_category(category, uses, run_id)
-        except Exception as exc:
-            knowledge.fail_ingestion(run_id, f"CIB&RC replacement failed: {exc}", len(uses), 0, 0)
-            print(f"  {category:15} FAILED: {exc}")
+            if run_id is None:
+                raise RuntimeError(f"could not start audit for {artifact.category}")
+            run_ids[artifact.category] = run_id
+        replace_all_categories(reviewed, run_ids)
+    except Exception as exc:
+        for artifact, uses in reviewed:
+            run_id = run_ids.get(artifact.category)
+            if run_id is not None:
+                try:
+                    knowledge.fail_ingestion(
+                        run_id, f"CIB&RC batch replacement failed: {exc}", len(uses), 0, 0
+                    )
+                except Exception:
+                    pass
+        print(f"CIB&RC batch replacement failed: {exc}")
+        db.close()
+        return 1
     if not dry:
         print("stored:", knowledge.counts())
         db.close()

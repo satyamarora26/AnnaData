@@ -242,3 +242,146 @@ def test_latin_registered_pesticide_answer_names_one_retained_record():
     assert changed
     assert "Acephate 75% SP" in cleaned
     assert "667 g/ha" in cleaned
+
+
+def test_intent_and_units_guard_unknown_fertilizer_material():
+    answer = "The recommended NPK quantity is 50 kg/acre. Keep the field evenly moist."
+    gathered = {
+        "_guard_context": {"intent": "fertiliser_nutrition"},
+        "_kb_passages": [_extension("Apply NPK 40 kg/acre.")],
+    }
+
+    cleaned, changed = output_guards.scrub(answer, gathered)
+
+    assert changed
+    assert "50 kg" not in cleaned
+    assert "evenly moist" in cleaned
+
+
+def test_intent_and_units_guard_pesticide_named_without_action_verb():
+    answer = "Acephate 500 ml/ha is suitable. Remove affected leaves."
+    gathered = {
+        "_guard_context": {"intent": "disease_pest"},
+        "doses": "No registered pesticide use was found.",
+    }
+
+    cleaned, changed = output_guards.scrub(answer, gathered)
+
+    assert changed
+    assert "Acephate" not in cleaned
+    assert "Remove affected leaves" in cleaned
+
+
+def test_currencyless_scheme_payment_requires_matching_evidence():
+    answer = "PM-KISAN pays 6000 each year. Keep your registration details current."
+
+    cleaned, changed = output_guards.scrub(answer, {"_kb_passages": []})
+
+    assert changed
+    assert "6000" not in cleaned
+    assert "registration details" in cleaned
+
+
+def test_numeric_eligibility_limit_requires_matching_evidence():
+    answer = "PM-KISAN eligibility is limited to 2 hectares. Check your land record."
+    gathered = {
+        "_kb_passages": [{
+            "tier": "official",
+            "source": "pm_kisan_guidelines",
+            "content": "PM-KISAN operational guidelines describe beneficiary eligibility.",
+            "authority": "Department of Agriculture and Farmers Welfare",
+        }],
+    }
+
+    cleaned, changed = output_guards.scrub(answer, gathered)
+
+    assert changed
+    assert "2 hectares" not in cleaned
+    assert "land record" in cleaned
+
+
+def test_named_scheme_cannot_borrow_figure_from_another_scheme():
+    answer = "PMFBY pays Rs 6,000 per year. Ask the district office how to enrol."
+    gathered = {
+        "_kb_passages": [{
+            "tier": "official",
+            "source": "pm_kisan_guidelines",
+            "title": "PM-KISAN Revised Operational Guidelines",
+            "content": "PM-KISAN provides Rs 6,000 per year to eligible farmers.",
+            "authority": "Department of Agriculture and Farmers Welfare",
+        }],
+    }
+
+    cleaned, changed = output_guards.scrub(answer, gathered)
+
+    assert changed
+    assert "6,000" not in cleaned
+    assert "district office" in cleaned
+
+
+def test_supported_currencyless_scheme_claim_names_matching_authority():
+    answer = "PM-KISAN pays 6000 each year."
+    gathered = {
+        "_kb_passages": [{
+            "tier": "official",
+            "source": "pm_kisan_guidelines",
+            "title": "PM-KISAN Revised Operational Guidelines",
+            "content": "PM-KISAN pays Rs 6,000 each year to eligible farmers.",
+            "authority": "Department of Agriculture and Farmers Welfare",
+        }],
+    }
+
+    cleaned, changed = output_guards.scrub(answer, gathered)
+
+    assert changed
+    assert "6000" in cleaned
+    assert "Department of Agriculture and Farmers Welfare" in cleaned
+
+
+def test_supported_scheme_eligibility_claim_names_matching_authority():
+    answer = "PMFBY eligibility includes sharecroppers."
+    gathered = {
+        "_kb_passages": [{
+            "tier": "official",
+            "source": "pmfby_2023_guidelines",
+            "title": "Operational Guidelines of PMFBY",
+            "content": "PMFBY eligibility includes sharecroppers and tenant farmers.",
+            "authority": "Ministry of Agriculture and Farmers Welfare",
+        }],
+    }
+
+    cleaned, changed = output_guards.scrub(answer, gathered)
+
+    assert changed
+    assert answer in cleaned
+    assert "Ministry of Agriculture and Farmers Welfare" in cleaned
+
+
+def test_scheme_authority_cannot_support_an_absent_eligibility_fact():
+    answer = "PMFBY eligibility includes sharecroppers. Check the official criteria."
+    gathered = {
+        "_kb_passages": [{
+            "tier": "official",
+            "source": "pmfby_2023_guidelines",
+            "title": "Operational Guidelines of PMFBY",
+            "content": "PMFBY eligibility requires an insurable crop and notified area.",
+            "authority": "Ministry of Agriculture and Farmers Welfare",
+        }],
+    }
+
+    cleaned, changed = output_guards.scrub(answer, gathered)
+
+    assert changed
+    assert "sharecroppers" not in cleaned
+    assert "official criteria" in cleaned
+    assert "Ministry of Agriculture and Farmers Welfare" not in cleaned
+
+
+def test_non_actionable_measurements_dates_stages_and_phone_survive():
+    answer = (
+        "Soil pH is 8.0 and rainfall was 25 mm. Sow on 15 June, inspect at the "
+        "3-leaf stage, and call 1800-180-1551."
+    )
+    gathered = {"_guard_context": {"intent": "fertiliser_nutrition"}}
+
+    assert output_guards.scrub(answer, gathered) == (answer, False)

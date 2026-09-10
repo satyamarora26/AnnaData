@@ -5,6 +5,7 @@ __pycache__/
 *.py[cod]
 .pytest_cache/
 *.log
-# Source PDFs are fetched with tools/fetch_cibrc.py; the parsed rows live in
-# the database. No need to carry 6 MB of government PDFs in the repo.
-data/
+# Source artifacts stay local; only their reviewed identity manifests are tracked.
+data/*
+!data/source_manifest.json
+!data/cibrc_manifest.json

@@ -23,8 +23,9 @@ LEGAL_QUANTITY = re.compile(
 )
 
 _MATERIAL = (
-    r"zinc\s+(?:sulphate|sulfate)|urea|dap|mop|ssp|potash|nitrogen|"
-    r"phosphorus|potassium|fertili[sz]er|manure|compost"
+    r"zinc\s+(?:sulphate|sulfate)|npk(?:\s+fertili[sz]er)?|urea|dap|mop|ssp|"
+    r"potash|nitrogen|phosphorus|potassium|fertili[sz]er|manure|compost|"
+    r"biofertili[sz]er|micronutrient|खाद|उर्वरक|ਖਾਦ|ખાતર|உரம்|khaad|khad|urvarak"
 )
 _AMOUNT = r"\d+(?:[.,]\d+)?(?:\s*(?:-|–|to)\s*\d+(?:[.,]\d+)?)?"
 _UNIT = r"kg|kgs|kilograms?|g|gm|grams?|l|lit(?:re|er)s?|ml|millilit(?:re|er)s?|tonnes?"
@@ -33,7 +34,9 @@ _BASIS = r"acres?|ha|hectares?|l|lit(?:re|er)s?"
 FERTILIZER_SUBJECT = re.compile(rf"\b(?:{_MATERIAL})\b", re.I)
 PESTICIDE_SUBJECT = re.compile(
     r"\b(?:spray(?:ed|ing|s)?|appl(?:y|ied|ying|ies)|use(?:d|ing|s)?|"
-    r"pesticide|insecticide|fungicide|herbicide|chemical|registered\s+pesticide|dose)\b",
+    r"recommend(?:ed|s|ing)?|pesticide|insecticide|fungicide|herbicide|"
+    r"biopesticide|chemical|registered\s+pesticide|dose|chhidkaav|chhidkav)\b|"
+    r"(?:छिड़काव|स्प्रे|ਕੀਟਨਾਸ਼ਕ|பூச்சிக்கொல்லி)",
     re.I,
 )
 
@@ -73,6 +76,44 @@ _PERCENTAGE = re.compile(
     r"\b(\d+(?:\.\d+)?)\s*(?:%|percent|per\s?cent|pratishat)(?=\s|$|[,.!?])",
     re.I,
 )
+_BARE_SCHEME_MONEY = re.compile(
+    r"\b(?:pays?|paid|provides?|amount|assistance|benefit|instalments?|installments?)"
+    r"(?:\s+of|\s+is|\s+are|\s+worth)?\s*([\d,]+(?:\.\d+)?)\b",
+    re.I,
+)
+_ELIGIBILITY_CONTEXT = re.compile(
+    r"\b(?:eligib(?:ility|le)|qualif(?:y|ies|ication)|limited?|limit|up\s+to|"
+    r"at\s+least|at\s+most|not\s+more\s+than|not\s+less\s+than|between|"
+    r"land\s*hold(?:ing|er))\b",
+    re.I,
+)
+_ELIGIBILITY_QUANTITY = re.compile(
+    rf"\b(?P<amount>{_AMOUNT})\s*(?P<unit>acres?|ha|hectares?|years?|"
+    r"months?|days?|members?|children|instalments?|installments?)\b",
+    re.I,
+)
+_ELIGIBILITY_ASSERTION = re.compile(
+    r"\b(?:eligibility\s+(?:includes?|requires?|excludes?|covers?|"
+    r"is\s+(?:limited|restricted)\s+to)|(?:is|are)\s+eligible\s+"
+    r"(?:if|when|only\s+if|for)|qualif(?:y|ies)\s+(?:if|when|for))\s+"
+    r"(?P<detail>[^.!?;\n]+)",
+    re.I,
+)
+_ELIGIBILITY_STOP_WORDS = {
+    "a", "an", "the", "and", "or", "of", "to", "for", "in", "on",
+    "with", "under", "is", "are", "be", "only", "all", "up", "not",
+    "more", "less", "than", "acre", "acres", "ha", "hectare", "hectares",
+    "year", "years", "month", "months", "day", "days",
+}
+
+_SCHEME_ENTITIES = {
+    "pm-kisan": re.compile(r"\bpm[-_\s]?kisan\b", re.I),
+    "pmfby": re.compile(r"\b(?:pmfby|pradhan\s+mantri\s+fasal\s+bima\s+yojana|fasal\s+bima)\b", re.I),
+    "kcc": re.compile(r"\b(?:kcc|kisan\s+credit\s+card)\b", re.I),
+    "soil-health-card": re.compile(r"\bsoil\s+health\s+card\b", re.I),
+    "pm-kusum": re.compile(r"\b(?:pm[-_\s]?kusum|kusum)\b", re.I),
+    "enam": re.compile(r"\b(?:e[-_\s]?nam|national\s+agriculture\s+market)\b", re.I),
+}
 FIGURE = re.compile(
     r"(?:₹|\brs\.?(?=\s|\d|$)|\binr\b)\s*[\d,]+(?:\.\d+)?|"
     r"\b[\d,]+(?:\.\d+)?\s*%(?=\s|$|[,.!?])|"
@@ -224,6 +265,35 @@ def extract_financial_figures(text: str) -> set[str]:
     return figures
 
 
+def extract_scheme_claims(text: str) -> set[str]:
+    """Return normalized financial and numeric eligibility claims."""
+    claims = extract_financial_figures(text)
+    if not WELFARE_SCHEME.search(text):
+        return claims
+    claims.update(
+        f"rupees:{match.group(1).replace(',', '')}"
+        for match in _BARE_SCHEME_MONEY.finditer(text)
+    )
+    if _ELIGIBILITY_CONTEXT.search(text):
+        claims.update(
+            "eligibility:"
+            f"{_normalise_amount(match.group('amount'))}:"
+            f"{_normalise_space(match.group('unit'))}"
+            for match in _ELIGIBILITY_QUANTITY.finditer(text)
+        )
+    for match in _ELIGIBILITY_ASSERTION.finditer(text):
+        claims.update(
+            f"eligibility-term:{token}"
+            for token in re.findall(r"[a-z][a-z-]*", match.group("detail").casefold())
+            if token not in _ELIGIBILITY_STOP_WORDS
+        )
+    return claims
+
+
+def extract_scheme_entities(text: str) -> set[str]:
+    return {name for name, pattern in _SCHEME_ENTITIES.items() if pattern.search(text)}
+
+
 def extract_product_recommendations(text: str) -> set[str]:
     """Return named products recommended by a direct English action verb."""
     products = set()
@@ -319,22 +389,38 @@ def _matched_dose_records(gathered: dict) -> list[tuple[str, set, set]]:
     return matched
 
 
-def _official_authorities_for_figures(gathered: dict, figures: set[str]) -> list[str]:
-    """Return authorities from official passages that support every stated figure."""
-    if not figures:
-        return []
-    authorities = []
+def _passage_identity_text(passage: dict) -> str:
+    return " ".join(
+        value for key in ("source", "title", "content")
+        if isinstance((value := passage.get(key)), str)
+    )
+
+
+def _supporting_scheme_passages(gathered: dict, sentence: str) -> list[dict]:
+    """Bind a scheme claim to official evidence for the same named entity."""
+    claims = extract_scheme_claims(sentence)
+    entities = extract_scheme_entities(sentence)
+    supporting = []
     for passage in gathered.get("_kb_passages") or []:
         if not isinstance(passage, dict) or str(passage.get("tier") or "").casefold() != "official":
             continue
         content = passage.get("content")
+        if not isinstance(content, str):
+            continue
+        if entities and not entities.issubset(extract_scheme_entities(_passage_identity_text(passage))):
+            continue
+        if claims and not claims.issubset(extract_scheme_claims(content)):
+            continue
+        if claims or entities:
+            supporting.append(passage)
+    return supporting
+
+
+def _official_scheme_authorities(gathered: dict, sentence: str) -> list[str]:
+    authorities = []
+    for passage in _supporting_scheme_passages(gathered, sentence):
         authority = passage.get("authority")
-        if (
-            isinstance(content, str)
-            and isinstance(authority, str)
-            and authority.strip()
-            and figures.issubset(extract_financial_figures(content))
-        ):
+        if isinstance(authority, str) and authority.strip():
             authorities.append(authority.strip())
     return list(dict.fromkeys(authorities))
 
@@ -376,6 +462,14 @@ def _matches_dose_record(products: set[str], claims: set, periods: set[int], rec
     )
 
 
+def _named_record_products(sentence: str, records: list[tuple[str, set, set]]) -> set[str]:
+    normalized = _normalise_space(sentence)
+    return {
+        product for product, _, _ in records
+        if re.search(r"\b" + re.escape(product) + r"\b", normalized, re.I)
+    }
+
+
 def _remove(category: str, reason: str) -> None:
     LOGGER.info("output_guard_removed category=%s reason=%s", category, reason)
 
@@ -389,15 +483,14 @@ def scrub(answer: str, gathered: dict) -> tuple[str, bool]:
     for passage in _passage_texts(gathered, {"official", "extension"}):
         fertilizer_claims.update(extract_input_claims(passage))
 
-    official_financial_figures = set()
-    for passage in _passage_texts(gathered, {"official"}):
-        official_financial_figures.update(extract_financial_figures(passage))
     official_legal_claims = set()
     for passage in _passage_texts(gathered, {"official"}):
         official_legal_claims.update(extract_input_claims(passage))
 
     dose_records = _matched_dose_records(gathered)
     msp_figures = extract_financial_figures(gathered.get("msp") or "")
+    context = gathered.get("_guard_context") or {}
+    intent = context.get("intent") if isinstance(context, dict) else None
 
     kept, changed = [], False
     for sentence in _sentences(answer):
@@ -405,14 +498,19 @@ def scrub(answer: str, gathered: dict) -> tuple[str, bool]:
             continue
         claims = extract_input_claims(sentence)
         products = extract_product_recommendations(sentence)
+        products.update(_named_record_products(sentence, dose_records))
         periods = extract_waiting_periods(sentence)
         category = reason = None
 
         if LEGAL_QUANTITY.search(sentence) and claims and not claims.issubset(official_legal_claims):
             category, reason = "legal", "unsupported_quantity"
-        elif FERTILIZER_SUBJECT.search(sentence) and not claims.issubset(fertilizer_claims):
+        elif (FERTILIZER_SUBJECT.search(sentence) or (claims and intent == "fertiliser_nutrition")) and not claims.issubset(fertilizer_claims):
             category, reason = "fertilizer", "unsupported_quantity"
-        elif PESTICIDE_SUBJECT.search(sentence) and not FERTILIZER_SUBJECT.search(sentence):
+        elif (
+            PESTICIDE_SUBJECT.search(sentence)
+            or products
+            or (claims and intent == "disease_pest")
+        ) and not FERTILIZER_SUBJECT.search(sentence):
             if (claims or products or periods) and not any(
                 _matches_dose_record(products, claims, periods, record)
                 for record in dose_records
@@ -428,8 +526,8 @@ def scrub(answer: str, gathered: dict) -> tuple[str, bool]:
             if figures and not figures.issubset(msp_figures):
                 category, reason = "msp", "unsupported_figure"
         if category is None and WELFARE_SCHEME.search(sentence):
-            figures = extract_financial_figures(sentence)
-            if figures and not figures.issubset(official_financial_figures):
+            scheme_claims = extract_scheme_claims(sentence)
+            if scheme_claims and not _supporting_scheme_passages(gathered, sentence):
                 category, reason = "scheme", "unsupported_figure"
 
         if category is not None:
@@ -439,8 +537,6 @@ def scrub(answer: str, gathered: dict) -> tuple[str, bool]:
         kept.append(sentence.strip())
 
     cleaned = " ".join(kept).strip() if changed else answer
-    context = gathered.get("_guard_context") or {}
-
     if (
         context.get("intent") == "fertiliser_nutrition"
         and _EXACT_FERTILIZER_REQUEST.search(str(context.get("query") or ""))
@@ -456,9 +552,7 @@ def scrub(answer: str, gathered: dict) -> tuple[str, bool]:
     scheme_authorities = []
     for sentence in _sentences(cleaned):
         if WELFARE_SCHEME.search(sentence):
-            scheme_authorities.extend(
-                _official_authorities_for_figures(gathered, extract_financial_figures(sentence))
-            )
+            scheme_authorities.extend(_official_scheme_authorities(gathered, sentence))
     for authority in dict.fromkeys(scheme_authorities):
         if authority.casefold() not in cleaned.casefold():
             cleaned = f"{cleaned.rstrip()} Source: {authority}.".strip()

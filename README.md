@@ -112,9 +112,11 @@ is context only and never authorizes a scheme amount, MSP, fertiliser quantity,
 or pesticide dose.
 
 Source artifacts under `data/downloads/` and CIB&RC PDFs under `data/cibrc/`
-are intentionally ignored by Git. Keep the catalog and ingestion code tracked;
-fetch source files again from their exact catalog URLs rather than committing
-them. From a fresh, empty downloads directory:
+are intentionally ignored by Git. The reviewed identity files
+`data/source_manifest.json` and `data/cibrc_manifest.json` are tracked. The
+CIB&RC manifest declares exactly six official artifacts and pins each retained
+PDF by URL, category, as-on date, and SHA-256. From a fresh, empty downloads
+directory:
 
 ```bash
 cd AnnaData-Backend-main
@@ -137,37 +139,61 @@ python tools/load_msp.py --csv data/downloads/msp-current.csv --year 2026-27 \
 valid inherited artifacts during a recovery. Validate those files with
 `python tools/ingest_docs.py --all --dry-run`, and fetch a missing source by ID
 instead. Browser-only sources must be saved from their exact manifest URL to
-the declared ignored path before the dry run.
+the declared ignored path before the dry run. HTTP fetches disable automatic
+redirects, validate every hop and final URL against the trusted host list, then
+extract and check the required identity terms before replacing a retained file.
 
-Every live ingestion invocation has an aggregate monotonic budget. The default
-is 300 seconds; use an explicit smaller value for a single source during a
-bounded verification, for example:
+The CIB&RC fetcher stages all six PDFs outside the retained directory and swaps
+the directory only after every manifest hash passes. The loader likewise
+requires all six exact PDFs, rejects an empty category, and publishes every
+category while completing its audit rows in the same database transaction. Any
+partial fetch, parse, audit, or replacement returns nonzero and preserves the
+prior set.
+
+Every live ingestion invocation has an aggregate monotonic budget covering
+validation, hashing, extraction, chunking, embedding, staging, and activation.
+The default is 300 seconds; use an explicit smaller value for a single source
+during a bounded verification, for example:
 
 ```bash
 python tools/ingest_docs.py --source-id soil_health_card_faq --deadline-seconds 90
 ```
 
-An expired budget fails the active ingestion audit and does not activate staged
-documents, preserving the prior active corpus. During activation, every SQL
-statement receives only the floored remaining budget and the whole transaction
-must be protected by PostgreSQL `transaction_timeout`. A server without that
-capability rejects activation before document mutation. Expiry before the final
-commit rolls back the replacement, and failure cleanup changes only a still-running
-audit rather than overwriting a completed, failed, or skipped result.
+An expired budget records a terminal failure where the database is available
+and does not activate staged documents, preserving the prior active corpus.
+Running document audits have a 300-second source-scoped lease. The heartbeat is
+renewed before bounded embedding work and each staged write; a new run
+atomically fails and cleans only an expired run, while fresh concurrent work is
+rejected.
 
-Document ingestion uses Gemini's official ordered batch embedding endpoint and
-passes its remaining aggregate budget as the request timeout. A Gemini HTTP 429
-is retried at most once, only when its finite numeric `Retry-After` delay fits
-inside a freshly measured remaining budget. It still records a failed audit and
-preserves the prior corpus when Gemini rejects a batch or the budget expires; a
-failed source must not be treated as idempotent success.
+Activation is compatible with PostgreSQL 16. Every SQL command is dispatched
+with the floored aggregate time remaining as transaction-local
+`statement_timeout`; that timeout is refreshed immediately before `COMMIT`,
+after one final local deadline check. PostgreSQL 16 has no transaction-wide
+`transaction_timeout`, so this is not a claim of an external hard wall-clock
+deadline. A connection loss while `COMMIT` is in flight can leave its outcome
+unknown to the caller. Document activation and the completed audit are in the
+same transaction, so inspect the terminal audit before reconciling or retrying
+an ambiguous result. Ordinary expiry before commit rolls the replacement back,
+and failure cleanup changes only a still-running audit.
+
+Document ingestion uses Gemini's official ordered batch embedding endpoint. An
+embedding request receives the smaller of the aggregate time remaining and
+half the lease interval, and the lease is refreshed immediately before that
+bounded unit of work. A Gemini HTTP 429 is retried at most once, only when its
+finite numeric `Retry-After` delay fits inside that freshly measured request
+budget. It still records a failed audit and preserves the prior corpus when
+Gemini rejects a batch or the budget expires; a failed source must not be
+treated as idempotent success.
 
 `GET /health` returns `status` plus an `integrations` object. Each configured
 provider exposes configured versus ready state; `database`, `earth_engine`, and
 `gemini` expose their initialization state; `knowledge` exposes provider,
 document and pesticide-use counts, and recent ingestion audits; `msp` exposes
-its readiness and commodity count. A configured-but-unready provider makes the
-top-level status `degraded`.
+its readiness and commodity count. Weather exposes `unknown`, `ready`,
+`degraded`, or `unavailable`, its final serving provider, and metadata for the
+last valid result without returning the report or raw provider errors. A
+configured-but-unready provider makes the top-level status `degraded`.
 
 ### Task 8 verification status (2026-09-10)
 

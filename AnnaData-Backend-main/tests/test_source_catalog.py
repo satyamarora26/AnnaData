@@ -65,3 +65,16 @@ def test_extension_scope_matches_only_its_declared_state_and_crop():
     assert scope_score(scope, "Punjab", "wheat") == 4
     assert scope_score(scope, "Punjab", "rice") is None
     assert scope_score(scope, "West Bengal", "wheat") is None
+
+
+def test_pau_packages_are_scoped_to_verified_seasonal_crops():
+    catalog = load_catalog(MANIFEST)
+    kharif = catalog["pau_kharif_2025"].scope
+    rabi = catalog["pau_rabi_2025_26"].scope
+
+    assert scope_score(kharif, "Punjab", "cotton") == 4
+    assert scope_score(kharif, "Punjab", "wheat") is None
+    assert scope_score(rabi, "Punjab", "wheat") == 4
+    assert scope_score(rabi, "Punjab", "rice") is None
+    assert scope_score(kharif, "Punjab", "apple") is None
+    assert scope_score(rabi, "Punjab", "apple") is None

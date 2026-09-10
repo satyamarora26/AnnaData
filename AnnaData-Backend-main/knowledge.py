@@ -34,6 +34,7 @@ EMBED_MODEL = "gemini-embedding-001"
 EMBED_DIM = 768
 ACTIVATION_TIMEOUT_SECONDS = 60
 ACTIVATION_TIMEOUT_SQLSTATES = {"57014", "25P04"}
+INGESTION_LEASE_SECONDS = 300
 
 
 class ActivationError(RuntimeError):
@@ -50,6 +51,10 @@ class ActivationDeadlineUnsupported(ActivationError):
 
 class ActivationStateError(ActivationError):
     """The ingestion audit is missing, terminal, or does not match the activation."""
+
+
+class IngestionLeaseActive(RuntimeError):
+    """Another process still owns a fresh lease for this source."""
 
 
 TIER_PRIORITY = {"official": 2, "extension": 1, "reference": 0}
@@ -92,6 +97,10 @@ CREATE TABLE IF NOT EXISTS ingestion_runs (
     started_at      TIMESTAMPTZ NOT NULL DEFAULT now(),
     completed_at    TIMESTAMPTZ
 );
+
+ALTER TABLE ingestion_runs ADD COLUMN IF NOT EXISTS heartbeat_at TIMESTAMPTZ NOT NULL DEFAULT now();
+CREATE INDEX IF NOT EXISTS ingestion_runs_running_lease
+    ON ingestion_runs (kind, source, heartbeat_at) WHERE status = 'running';
 
 -- Reference text for open-ended questions.
 CREATE TABLE IF NOT EXISTS documents (
@@ -449,11 +458,45 @@ def format_uses(result: dict, pest: str | None = None) -> str:
 # --- reference text ---------------------------------------------------------
 
 def start_ingestion(kind: str, source: str, source_url: str, content_hash: str,
-                    skip_completed: bool = True) -> int | None:
+                    skip_completed: bool = True,
+                    lease_seconds: int = INGESTION_LEASE_SECONDS) -> int | None:
     """Create an auditable ingestion run unless this content is already live."""
     if not db.is_available():
         raise RuntimeError("database unavailable during ingestion")
     with db.connection() as conn:
+        locked = conn.execute(
+            "SELECT pg_try_advisory_xact_lock(hashtext(%s))",
+            (source,),
+        ).fetchone()
+        if not locked or not locked[0]:
+            raise IngestionLeaseActive(f"ingestion is already running for {source}")
+
+        stale_rows = conn.execute(
+            """UPDATE ingestion_runs
+                  SET status = 'failed', error = 'stale ingestion lease expired',
+                      completed_at = now()
+                WHERE kind = %s AND source = %s AND status = 'running'
+                  AND heartbeat_at < now() - (%s * interval '1 second')
+            RETURNING id""",
+            (kind, source, max(1, int(lease_seconds))),
+        ).fetchall()
+        stale_ids = [row[0] for row in stale_rows]
+        if stale_ids:
+            conn.execute(
+                """DELETE FROM documents
+                     WHERE ingestion_run_id = ANY(%s) AND active = FALSE""",
+                (stale_ids,),
+            )
+
+        live = conn.execute(
+            """SELECT 1 FROM ingestion_runs
+                 WHERE kind = %s AND source = %s AND status = 'running'
+                 LIMIT 1""",
+            (kind, source),
+        ).fetchone()
+        if live:
+            raise IngestionLeaseActive(f"ingestion is already running for {source}")
+
         if not skip_completed:
             prior = None
         elif kind == "document":
@@ -482,12 +525,31 @@ def start_ingestion(kind: str, source: str, source_url: str, content_hash: str,
     return None if prior else row[0]
 
 
+def _renew_ingestion_lease(conn, run_id: int, source: str) -> bool:
+    return conn.execute(
+        """UPDATE ingestion_runs SET heartbeat_at = now()
+             WHERE id = %s AND source = %s AND status = 'running'
+         RETURNING id""",
+        (run_id, source),
+    ).fetchone() is not None
+
+
+def renew_ingestion_lease(run_id: int, source: str) -> bool:
+    """Renew a live source lease before a bounded unit of expensive work."""
+    if not db.is_available():
+        return False
+    with db.connection() as conn:
+        return _renew_ingestion_lease(conn, run_id, source)
+
+
 def stage_document(run_id: int, spec: SourceSpec, content_hash: str,
                    content: str, chunk_index: int,
                    embedding: list[float]) -> bool:
     """Write an inactive document chunk that can be published as a complete set."""
     try:
         with db.connection() as conn:
+            if not _renew_ingestion_lease(conn, run_id, spec.id):
+                return False
             conn.execute(
                 """INSERT INTO documents
                        (source, title, url, authority, tier, published_on, scope,
@@ -511,7 +573,14 @@ def activate_documents(run_id: int, spec: SourceSpec, content_hash: str,
                        deadline_at: float | None = None,
                        timeout_seconds: float | None = ACTIVATION_TIMEOUT_SECONDS,
                        clock=time.monotonic) -> bool:
-    """Atomically replace a source only when every parsed chunk was staged."""
+    """Atomically publish a complete source under a PostgreSQL 16 deadline.
+
+    Every statement receives the aggregate budget remaining at dispatch time,
+    including COMMIT. PostgreSQL 16 has no transaction-wide timeout, so a lost
+    connection during COMMIT can leave its outcome unknown to this process; the
+    audit row and document activation are committed together and callers must
+    treat a terminal completed audit as authoritative during reconciliation.
+    """
     if deadline_at is None:
         if timeout_seconds is None:
             raise ActivationDeadlineUnsupported("document activation requires a deadline")
@@ -525,24 +594,20 @@ def activate_documents(run_id: int, spec: SourceSpec, content_hash: str,
 
     try:
         with db.connection() as conn:
-            def execute(sql: str, params=()):
+            def set_statement_timeout() -> None:
                 conn.execute(
                     "SELECT set_config('statement_timeout', %s, true)",
                     (f"{remaining_milliseconds()}ms",),
                 )
+
+            def execute(sql: str, params=()):
+                set_statement_timeout()
                 return conn.execute(sql, params)
 
-            transaction_timeout = execute(
-                "SELECT current_setting('transaction_timeout', true)"
-            ).fetchone()
-            if not transaction_timeout or transaction_timeout[0] is None:
-                raise ActivationDeadlineUnsupported(
-                    "database does not support transaction_timeout; activation rejected"
-                )
-            conn.execute(
-                "SELECT set_config('transaction_timeout', %s, true)",
-                (f"{remaining_milliseconds()}ms",),
-            )
+            def commit() -> None:
+                set_statement_timeout()
+                remaining_milliseconds()
+                conn.commit()
 
             execute(
                 "SELECT pg_advisory_xact_lock(hashtext(%s))",
@@ -580,8 +645,7 @@ def activate_documents(run_id: int, spec: SourceSpec, content_hash: str,
                     raise ActivationStateError(
                         f"completed ingestion audit {run_id} does not own the active corpus"
                     )
-                remaining_milliseconds()
-                conn.commit()
+                commit()
                 return True
             if audit_status != "running":
                 raise ActivationStateError(
@@ -632,8 +696,7 @@ def activate_documents(run_id: int, spec: SourceSpec, content_hash: str,
                     WHERE id = %s""",
                 (parsed, stored, rejected, run_id),
             )
-            remaining_milliseconds()
-            conn.commit()
+            commit()
             return True
     except Exception as exc:
         if isinstance(exc, ActivationError):
