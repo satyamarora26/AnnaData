@@ -931,6 +931,39 @@ The final pre-commit rerun reported **107 passed in 0.87s** for the complete
 backend suite; the frontend test again passed 1/1 in 0.718s without warnings,
 and the frontend build compiled successfully with the same Browserslist notice.
 
+### Task 8 fix round 2 (2026-09-10)
+
+The ingestion bottleneck was not extraction: it was one fixed 60-second Gemini
+embedding request for every document chunk, with deadline checks only between
+calls. Ingestion now sends ordered batches of 20 chunks to Gemini's official
+`batchEmbedContents` endpoint, validates count and 768-dimension order, passes
+the remaining aggregate budget as the network timeout, and checks the deadline
+immediately before and after every batch, staging operation, and activation.
+Interrupted embedding now records a failed audit and rolls back staged rows.
+Focused ingestion, output-guard, and knowledge tests reported **63 passed**;
+the final full backend suite reported **112 passed in 0.96s**.
+
+Fertiliser compatibility is now material-specific. A zinc request cannot treat
+a DAP passage as supporting evidence, so an exact zinc request without a
+matching retained zinc claim receives the soil-test/KVK/agriculture-officer
+referral and no invented amount.
+
+Managed PTY sessions served the current backend on 8012 and frontend on 3012.
+Backend health returned `status: ok` with 46 documents. The in-app browser was
+unavailable in this task (`IAB visibility is not supported in a subagent
+thread`), and no Playwright, Puppeteer, Cypress, or browser executable was
+installed, so visible browser submission could not be performed. Those two
+sessions were stopped cleanly after health checks.
+
+Each retained large source received one 240-second aggregate batch attempt.
+Gemini returned HTTP 429 before any source completed: PMFBY `805/120/685`, NHB
+`971/60/911`, PAU Kharif `683/20/663`, and managed PAU Rabi `596/80/516`
+(parsed/stored/rejected). The attempted non-managed PAU Rabi process left a
+zero-row running audit; it was explicitly failed and rolled back before the
+managed attempt. The final live snapshot was unchanged: 46 active chunks,
+including PM-KISAN 38 and Soil Health Card 8. No large source completed, so no
+idempotence rerun is claimed.
+
 ### Open-Meteo rate limits by IP, and the IP is shared
 
 Weather worked locally in 2s and failed in production. The cause was

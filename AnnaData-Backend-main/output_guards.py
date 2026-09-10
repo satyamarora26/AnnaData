@@ -275,6 +275,11 @@ def _passage_texts(gathered: dict, allowed_tiers: set[str]) -> list[str]:
     return texts
 
 
+def _requested_fertilizer_material(query: str) -> str | None:
+    match = FERTILIZER_SUBJECT.search(query)
+    return _normalise_material(match.group()) if match else None
+
+
 def _is_unmatched_dose_context(doses: str) -> bool:
     lowered = doses.lstrip().lower()
     return lowered.startswith("warning:") or lowered.startswith("no registered pesticide use")
@@ -439,7 +444,10 @@ def scrub(answer: str, gathered: dict) -> tuple[str, bool]:
     if (
         context.get("intent") == "fertiliser_nutrition"
         and _EXACT_FERTILIZER_REQUEST.search(str(context.get("query") or ""))
-        and not fertilizer_claims
+        and not any(
+            claim[0] == _requested_fertilizer_material(str(context.get("query") or ""))
+            for claim in fertilizer_claims
+        )
         and "soil test" not in cleaned.casefold()
     ):
         cleaned = f"{cleaned.rstrip()} {FERTILIZER_REFERRAL}".strip()

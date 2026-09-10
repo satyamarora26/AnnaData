@@ -14,6 +14,7 @@ CHUNK_CHARS = 1000
 OVERLAP_CHARS = 150
 MIN_CHUNK_CHARS = 120
 SUPPORTED_EXTENSIONS = {".pdf", ".html", ".htm", ".txt"}
+EMBED_BATCH_SIZE = 20
 
 
 @dataclass(frozen=True)
@@ -157,6 +158,14 @@ def ingest_source(
 
     deadline_at = None if deadline_seconds is None else started_at + deadline_seconds
 
+    def remaining_seconds() -> float | None:
+        if deadline_at is None:
+            return None
+        remaining = deadline_at - time.monotonic()
+        if remaining <= 0:
+            raise TimeoutError("ingestion deadline exceeded")
+        return remaining
+
     run_id = knowledge.start_ingestion("document", spec.id, spec.source_url, content_hash)
     if run_id is None:
         return IngestResult(spec.id, "skipped", content_hash, len(chunks), 0, 0)
@@ -164,31 +173,30 @@ def ingest_source(
     stored = 0
     rejected = 0
     try:
-        for index, text in enumerate(chunks):
-            if deadline_at is not None and time.monotonic() >= deadline_at:
-                knowledge.fail_ingestion(
-                    run_id, "ingestion deadline exceeded", len(chunks), stored, len(chunks) - stored
-                )
-                return IngestResult(
-                    spec.id, "failed", content_hash, len(chunks), stored, len(chunks) - stored
-                )
-            vector = knowledge.embed(text)
-            if deadline_at is not None and time.monotonic() >= deadline_at:
-                knowledge.fail_ingestion(
-                    run_id, "ingestion deadline exceeded", len(chunks), stored, len(chunks) - stored
-                )
-                return IngestResult(
-                    spec.id, "failed", content_hash, len(chunks), stored, len(chunks) - stored
-                )
-            if vector is None:
-                rejected += 1
-                continue
-            if knowledge.stage_document(run_id, spec, content_hash, text, index, vector):
-                stored += 1
-            else:
-                rejected += 1
-    except Exception as exc:
-        knowledge.fail_ingestion(run_id, str(exc), len(chunks), stored, len(chunks) - stored)
+        for offset in range(0, len(chunks), EMBED_BATCH_SIZE):
+            batch = chunks[offset:offset + EMBED_BATCH_SIZE]
+            vectors = knowledge.embed_batch(
+                batch, timeout_seconds=remaining_seconds() or 60
+            )
+            remaining_seconds()
+            if vectors is None or len(vectors) != len(batch):
+                rejected += len(batch)
+                break
+            for index, (text, vector) in enumerate(zip(batch, vectors), start=offset):
+                remaining_seconds()
+                if knowledge.stage_document(run_id, spec, content_hash, text, index, vector):
+                    stored += 1
+                else:
+                    rejected += 1
+                remaining_seconds()
+    except (Exception, KeyboardInterrupt) as exc:
+        if isinstance(exc, TimeoutError):
+            error = "ingestion deadline exceeded"
+        elif isinstance(exc, KeyboardInterrupt):
+            error = "ingestion interrupted"
+        else:
+            error = str(exc)
+        knowledge.fail_ingestion(run_id, error, len(chunks), stored, len(chunks) - stored)
         return IngestResult(spec.id, "failed", content_hash, len(chunks), stored, len(chunks) - stored)
 
     if rejected or stored != len(chunks):
@@ -201,6 +209,13 @@ def ingest_source(
         )
         return IngestResult(spec.id, "failed", content_hash, len(chunks), stored, len(chunks) - stored)
 
-    if not knowledge.activate_documents(run_id, spec, content_hash, len(chunks), stored, 0):
+    try:
+        remaining_seconds()
+        activated = knowledge.activate_documents(run_id, spec, content_hash, len(chunks), stored, 0)
+    except Exception as exc:
+        error = "ingestion deadline exceeded" if isinstance(exc, TimeoutError) else str(exc)
+        knowledge.fail_ingestion(run_id, error, len(chunks), stored, len(chunks) - stored)
+        return IngestResult(spec.id, "failed", content_hash, len(chunks), stored, len(chunks) - stored)
+    if not activated:
         return IngestResult(spec.id, "failed", content_hash, len(chunks), stored, 0)
     return IngestResult(spec.id, "completed", content_hash, len(chunks), stored, 0)

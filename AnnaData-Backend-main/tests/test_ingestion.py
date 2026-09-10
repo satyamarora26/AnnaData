@@ -66,7 +66,7 @@ def test_embedding_failure_preserves_active_corpus(tmp_path, monkeypatch):
     path.write_text(_guidance_text(), encoding="utf-8")
     events = []
     monkeypatch.setattr(ingestion.knowledge, "start_ingestion", lambda kind, source, url, digest: 9)
-    monkeypatch.setattr(ingestion.knowledge, "embed", lambda text: None)
+    monkeypatch.setattr(ingestion.knowledge, "embed_batch", lambda texts, **kwargs: None)
     monkeypatch.setattr(
         ingestion.knowledge,
         "activate_documents",
@@ -91,7 +91,11 @@ def test_complete_ingestion_activates_all_chunks(tmp_path, monkeypatch):
     path.write_text(_guidance_text() + ("Wheat nutrient guidance for Punjab fields. " * 60), encoding="utf-8")
     staged = []
     monkeypatch.setattr(ingestion.knowledge, "start_ingestion", lambda kind, source, url, digest: 12)
-    monkeypatch.setattr(ingestion.knowledge, "embed", lambda text: [0.0] * 768)
+    monkeypatch.setattr(
+        ingestion.knowledge,
+        "embed_batch",
+        lambda texts, **kwargs: [[0.0] * 768 for _ in texts],
+    )
     monkeypatch.setattr(
         ingestion.knowledge,
         "stage_document",
@@ -114,13 +118,35 @@ def test_unexpected_embedding_error_fails_the_run(tmp_path, monkeypatch):
     path.write_text(_guidance_text(), encoding="utf-8")
     failures = []
     monkeypatch.setattr(ingestion.knowledge, "start_ingestion", lambda *args: 17)
-    monkeypatch.setattr(ingestion.knowledge, "embed", lambda text: (_ for _ in ()).throw(RuntimeError("quota")))
+    monkeypatch.setattr(
+        ingestion.knowledge,
+        "embed_batch",
+        lambda texts, **kwargs: (_ for _ in ()).throw(RuntimeError("quota")),
+    )
     monkeypatch.setattr(ingestion.knowledge, "fail_ingestion", lambda *args: failures.append(args))
 
     result = ingestion.ingest_source(_spec(), path)
 
     assert result.status == "failed"
     assert failures == [(17, "quota", result.parsed, 0, result.parsed)]
+
+
+def test_interrupted_embedding_rolls_back_the_audit(tmp_path, monkeypatch):
+    path = tmp_path / "guidance.txt"
+    path.write_text(_guidance_text(), encoding="utf-8")
+    failures = []
+    monkeypatch.setattr(ingestion.knowledge, "start_ingestion", lambda *args: 18)
+    monkeypatch.setattr(
+        ingestion.knowledge,
+        "embed_batch",
+        lambda texts, **kwargs: (_ for _ in ()).throw(KeyboardInterrupt()),
+    )
+    monkeypatch.setattr(ingestion.knowledge, "fail_ingestion", lambda *args: failures.append(args))
+
+    result = ingestion.ingest_source(_spec(), path, deadline_seconds=30)
+
+    assert result.status == "failed"
+    assert failures == [(18, "ingestion interrupted", result.parsed, 0, result.parsed)]
 
 
 def test_ingestion_deadline_rolls_back_without_activation(tmp_path, monkeypatch):
@@ -130,8 +156,8 @@ def test_ingestion_deadline_rolls_back_without_activation(tmp_path, monkeypatch)
     monkeypatch.setattr(ingestion.knowledge, "start_ingestion", lambda *args: "run-deadline")
     monkeypatch.setattr(
         ingestion.knowledge,
-        "embed",
-        lambda text: pytest.fail("deadline should prevent embedding"),
+        "embed_batch",
+        lambda texts, **kwargs: pytest.fail("deadline should prevent embedding"),
     )
     monkeypatch.setattr(ingestion.knowledge, "fail_ingestion", lambda *args: failures.append(args))
     monkeypatch.setattr(
@@ -146,6 +172,44 @@ def test_ingestion_deadline_rolls_back_without_activation(tmp_path, monkeypatch)
     assert failures == [(
         "run-deadline", "ingestion deadline exceeded", result.parsed, 0, result.parsed
     )]
+
+
+def test_deadline_before_staging_rolls_back_without_activation(tmp_path, monkeypatch):
+    path = tmp_path / "guidance.txt"
+    path.write_text(_guidance_text(), encoding="utf-8")
+    failures = []
+    clock = iter((0, 0, 0, 1))
+    monkeypatch.setattr(ingestion, "chunk_text", lambda text: [text])
+    monkeypatch.setattr(ingestion.time, "monotonic", lambda: next(clock))
+    monkeypatch.setattr(ingestion.knowledge, "start_ingestion", lambda *args: 21)
+    monkeypatch.setattr(ingestion.knowledge, "embed_batch", lambda texts, **kwargs: [[0.0] * 768])
+    monkeypatch.setattr(ingestion.knowledge, "stage_document", lambda *args: pytest.fail("must not stage"))
+    monkeypatch.setattr(ingestion.knowledge, "activate_documents", lambda *args: pytest.fail("must not activate"))
+    monkeypatch.setattr(ingestion.knowledge, "fail_ingestion", lambda *args: failures.append(args))
+
+    result = ingestion.ingest_source(_spec(), path, deadline_seconds=1)
+
+    assert result.status == "failed"
+    assert failures == [(21, "ingestion deadline exceeded", 1, 0, 1)]
+
+
+def test_deadline_before_activation_rolls_back_after_staging(tmp_path, monkeypatch):
+    path = tmp_path / "guidance.txt"
+    path.write_text(_guidance_text(), encoding="utf-8")
+    failures = []
+    clock = iter((0, 0, 0, 0, 0, 1))
+    monkeypatch.setattr(ingestion, "chunk_text", lambda text: [text])
+    monkeypatch.setattr(ingestion.time, "monotonic", lambda: next(clock))
+    monkeypatch.setattr(ingestion.knowledge, "start_ingestion", lambda *args: 22)
+    monkeypatch.setattr(ingestion.knowledge, "embed_batch", lambda texts, **kwargs: [[0.0] * 768])
+    monkeypatch.setattr(ingestion.knowledge, "stage_document", lambda *args: True)
+    monkeypatch.setattr(ingestion.knowledge, "activate_documents", lambda *args: pytest.fail("must not activate"))
+    monkeypatch.setattr(ingestion.knowledge, "fail_ingestion", lambda *args: failures.append(args))
+
+    result = ingestion.ingest_source(_spec(), path, deadline_seconds=1)
+
+    assert result.status == "failed"
+    assert failures == [(22, "ingestion deadline exceeded", 1, 1, 0)]
 
 
 def test_fetch_rejects_invalid_replacement_without_overwriting_local_file(tmp_path, monkeypatch):

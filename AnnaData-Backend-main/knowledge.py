@@ -122,7 +122,7 @@ def init() -> bool:
         return False
 
 
-def embed(text: str, dim: int = EMBED_DIM) -> list[float] | None:
+def embed(text: str, dim: int = EMBED_DIM, timeout_seconds: float = 60) -> list[float] | None:
     """Embed one piece of text, or None if the call fails."""
     if not GEMINI_API_KEY or not text:
         return None
@@ -136,10 +136,45 @@ def embed(text: str, dim: int = EMBED_DIM) -> list[float] | None:
     try:
         req = urllib.request.Request(url, data=body,
                                      headers={"Content-Type": "application/json"})
-        with urllib.request.urlopen(req, timeout=60) as r:
+        with urllib.request.urlopen(req, timeout=timeout_seconds) as r:
             return json.load(r)["embedding"]["values"]
     except Exception as e:
         print(f"Embedding failed: {e}")
+        return None
+
+
+def embed_batch(
+    texts: list[str], dim: int = EMBED_DIM, timeout_seconds: float = 60
+) -> list[list[float]] | None:
+    """Embed an ordered batch through Gemini's documented batch endpoint."""
+    if not GEMINI_API_KEY or not texts or timeout_seconds <= 0:
+        return None
+    requests = [
+        {
+            "model": f"models/{EMBED_MODEL}",
+            "content": {"parts": [{"text": text}]},
+            "outputDimensionality": dim,
+        }
+        for text in texts
+    ]
+    body = json.dumps({"requests": requests}).encode()
+    url = f"https://generativelanguage.googleapis.com/v1beta/models/{EMBED_MODEL}:batchEmbedContents"
+    try:
+        req = urllib.request.Request(
+            url,
+            data=body,
+            headers={"Content-Type": "application/json", "x-goog-api-key": GEMINI_API_KEY},
+        )
+        with urllib.request.urlopen(req, timeout=timeout_seconds) as response:
+            embeddings = json.load(response).get("embeddings")
+        if not isinstance(embeddings, list) or len(embeddings) != len(texts):
+            raise ValueError("batch embedding response count did not match request count")
+        values = [item.get("values") if isinstance(item, dict) else None for item in embeddings]
+        if any(not isinstance(vector, list) or len(vector) != dim for vector in values):
+            raise ValueError("batch embedding response had an unexpected dimension")
+        return values
+    except Exception as exc:
+        print(f"Batch embedding failed: {exc}")
         return None
 
 

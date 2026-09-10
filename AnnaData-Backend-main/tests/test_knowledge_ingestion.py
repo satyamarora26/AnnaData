@@ -416,3 +416,31 @@ def test_document_reads_filter_to_active_rows(monkeypatch):
     ]
     assert len(document_reads) == 4
     assert all("active = TRUE" in sql for sql in document_reads)
+def test_batch_embed_uses_official_endpoint_and_remaining_timeout(monkeypatch):
+    captured = {}
+
+    class Response:
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *args):
+            return None
+
+        def read(self):
+            return b'{"embeddings": [{"values": [0.1, 0.2]}, {"values": [0.3, 0.4]}]}'
+
+    def urlopen(request, timeout):
+        captured["url"] = request.full_url
+        captured["body"] = request.data
+        captured["timeout"] = timeout
+        return Response()
+
+    monkeypatch.setattr(knowledge, "GEMINI_API_KEY", "test-key")
+    monkeypatch.setattr(knowledge.urllib.request, "urlopen", urlopen)
+
+    result = knowledge.embed_batch(["first", "second"], dim=2, timeout_seconds=7.5)
+
+    assert result == [[0.1, 0.2], [0.3, 0.4]]
+    assert captured["url"].endswith("models/gemini-embedding-001:batchEmbedContents")
+    assert b'"requests"' in captured["body"]
+    assert captured["timeout"] == 7.5

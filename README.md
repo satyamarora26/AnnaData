@@ -150,6 +150,11 @@ python tools/ingest_docs.py --source-id soil_health_card_faq --deadline-seconds 
 An expired budget fails the active ingestion audit and does not activate staged
 documents, preserving the prior active corpus.
 
+Document ingestion uses Gemini's official ordered batch embedding endpoint and
+passes its remaining aggregate budget as the request timeout. It still records
+a failed audit and preserves the prior corpus when Gemini rejects a batch or
+the budget expires; a failed source must not be treated as idempotent success.
+
 `GET /health` returns `status` plus an `integrations` object. Each configured
 provider exposes configured versus ready state; `database`, `earth_engine`, and
 `gemini` expose their initialization state; `knowledge` exposes provider,
@@ -176,6 +181,13 @@ build passed. The two repaired live evaluation cases passed once each, with
 reported latencies of 9.10s and 6.80s. Fresh-port browser E2E remains
 unverified: sandbox port binding was denied, the one permitted retry exposed no
 listener on ports 8011 or 3011, and bounded localhost requests were refused.
+
+In fix round 2, managed sessions successfully served a fresh backend on 8012
+and frontend on 3012, but this task's native browser was unavailable and no
+Playwright, Puppeteer, Cypress, or browser executable was installed. The four
+large retained documents made one bounded batch attempt each; Gemini returned
+HTTP 429 before any could activate. The live corpus remains 46 active chunks:
+38 PM-KISAN and 8 Soil Health Card.
 
 ---
 

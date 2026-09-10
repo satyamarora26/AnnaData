@@ -208,6 +208,23 @@ def test_exact_fertilizer_question_without_evidence_adds_field_referral():
     assert "Krishi Vigyan Kendra" in cleaned
 
 
+def test_unrelated_fertilizer_evidence_does_not_suppress_zinc_referral():
+    answer = "Apply zinc fertiliser carefully."
+    gathered = {
+        "_guard_context": {
+            "intent": "fertiliser_nutrition",
+            "query": "Exactly how much zinc sulphate should I use per acre?",
+        },
+        "_kb_passages": [_extension("Apply 55 kg DAP per acre at sowing.")],
+    }
+
+    cleaned, changed = output_guards.scrub(answer, gathered)
+
+    assert changed
+    assert "soil test" in cleaned.lower()
+    assert "Krishi Vigyan Kendra" in cleaned
+
+
 def test_latin_registered_pesticide_answer_names_one_retained_record():
     answer = "Please inspect the affected plants before spraying."
     gathered = {
